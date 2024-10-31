@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  a10:
+    image: a10
+    container_name: a10-container
+    hostname: a10
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+      - "8081:8081"
+      - "222:22"
+    volumes:
+      - ./app:/backup/app
+#      - ./certs:/backup/certs
+#      - ./logs:/backup/logs
+    environment:
+      - TZ=UTC
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - SYS_MODULE
+      - NET_ADMIN
+
+volumes:
+  src:
+  certs:
+  logs:
+

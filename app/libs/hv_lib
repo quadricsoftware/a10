@@ -1,0 +1,137 @@
+<?php
+namespace HV;
+include_once(__DIR__."/common_lib");
+
+function getHostGuid($ip){
+	$q = "Get-CimInstance -Class Win32_ComputerSystemProduct | Select-Object -ExpandProperty UUID";
+	$out = trim(agentScript($ip, $q));	
+	$enc = json_decode($out);
+	return trim($enc->output);
+}
+
+function listVms($ip){
+	$q = 'Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem | ForEach-Object { ($_.Name, $_.ElementName, $_.EnabledState, $_.Caption) -join "|" } | Format-Table -HideTableHeaders -AutoSize';
+	
+	$out = trim(agentScript($ip, $q));	
+	$enc = json_decode($out);
+	
+	$bits = explode("\r\n", $enc->output);
+	$vms = array();
+	foreach($bits as $b){
+		$vm = explode("|", $b);
+		if(empty($vm[0]) ){ continue; }
+		if($vm[3] == "Hosting Computer System" ){ continue; }	// skip the host
+		$v = new \stdClass();
+		$v->guid = $vm[0];
+		$v->name = $vm[1];
+		$v->type = 3;
+		$v->state = $vm[2];
+		$v->ip = "";
+		$v->cpus = 1;
+		$v->memory = 1;
+		$v->totalSize = 2;
+		array_push($vms, $v);
+	}
+	
+	return $vms;
+}
+
+function getVmMeta($ip, $guid){
+	$vm = new \stdClass();
+	$vm->guid = $guid;
+
+	$q = '$vhds =Get-VHD -VMid '.$guid.'; Foreach($hd in $vhds){ Write-Host "$($hd.size)"; }';
+	$out = json_decode(trim(agentScript($ip, $q)));
+	$dsizes = array_filter(explode("\n",trim($out->output)) );
+
+	$q = '(Get-VM -Id '. $guid.' | Get-VMHardDiskDrive).Path';
+	$out = json_decode(trim(agentScript($ip, $q)));
+	$dpaths = array_filter(explode("\n",trim($out->output)) );
+	$vm->disks =[];
+	foreach($dpaths as $i => $d){
+		$disk = new \stdClass();
+		$disk->position = $i;
+		$disk->uuid = $d;	
+		$disk->size = $dsizes[$i];
+		$disk->name = "Disk $i";
+		array_push($vm->disks, $disk);
+	}
+
+	$q = "(Get-VM -Id $guid).Name";
+	$out = json_decode(trim(agentScript($ip, $q)));
+	$vm->name = trim($out->output);	
+
+	$q = "Get-CimInstance -Namespace root\\virtualization\\v2 -ClassName Msvm_ProcessorSettingData | Where-Object { \$_.InstanceID -like '*$guid*' } | Select-Object -ExpandProperty VirtualQuantity
+";
+	$out = json_decode(trim(agentScript($ip, $q)));
+	$vm->cpus = $out->output;
+	$q = "(Get-CimInstance -Namespace root\\virtualization\\v2 -ClassName Msvm_MemorySettingData -Filter \"InstanceID LIKE '%FBD2F933-74C2-4F2F-B64A-0F70969A2CE8%'\").Limit
+";
+	$out = json_decode(trim(agentScript($ip, $q)));
+	$vm->memory = $out->output;
+
+	$q = "(Get-VMNetworkAdapter -VMName \"$vm->name\").MacAddress";
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	$nics = array_filter(explode("\n",$out->output));
+	$vm->nics = [];
+	foreach($nics as $i => $n){
+		$nic = new \stdClass();
+		$nic->device = $i;
+		$nic->MAC = $n;
+		$nic->network = "";
+		array_push($vm->nics, $nic);
+	}
+
+	$vm->mbr_or_uefi = "uefi";
+	$vm->secureboot = "false";
+
+	$q = "Get-CimInstance -Namespace root\\virtualization\\v2  -ClassName Msvm_VirtualSystemSettingData -Filter \"ConfigurationID = '$guid'\" | Select-Object -Property SecureBootEnabled,VirtualSystemSubtype  | Format-Table -HideTableHeaders -AutoSize";
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	$bits = array_filter(explode(" ",trim($out->output)));
+	if($bits[0] === "True"){	
+		$vm->secureboot = "true";
+	}
+	if(str_contains($bits[1], "SubType:1")){
+		$vm->mbr_or_uefi = "mbr";
+	}
+
+	return $vm;
+}
+function attachVhd($ip, $path){
+	$q = '$DevicePath = (Mount-VHD -Path \''.trim($path).'\' -Readonly | Get-Disk).DevicePath; Write-Host "Device Path: $DevicePath"';	
+	$q = '$MountedVhd = Mount-VHD -Path \''.trim($path).'\'  -ReadOnly -PassThru; Write-Host "$($MountedVhd.DiskNumber)"';
+
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	return $out->output;
+}
+function detachVhd($ip, $path){
+	$q= 'Dismount-VHD -Path "'.$path.'"';
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	return $out->output;
+}
+
+function snapshotVm($ip, $guid, $snapName){
+	$q = "get-vm -id $guid | checkpoint-vm -snapshotname $snapName";	
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	return $out->output;
+}
+function deleteSnapshot($ip, $guid, $snapName){
+	$q ='get-vm -id '.$guid.'  | get-vmsnapshot | where-object { $_.name -like "'.$snapName.'*" } | Remove-vmsnapshot';
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	return $out->output;
+}
+function getSnapDisks($ip, $guid, $snapName){
+	$q = 'get-vm -id '.$guid.' | get-vmsnapshot |where-object {$_.name -like "'.$snapName.'*" } | get-vmharddiskdrive | select-object -ExpandProperty path | Format-Table -HideTableHeaders -AutoSize';	
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	$disks = array_filter(explode("\n",trim($out->output)));
+	return $disks;
+}
+function getDefaultVhdPath($ip, $snapName){
+	
+	$q = "(get-VMHost).VirtualHardDiskPat";
+	$out = json_decode(trim(agentScript($ip, $q)));	
+	return $out->output;
+}
+
+?>
+

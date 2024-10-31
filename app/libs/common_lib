@@ -1,0 +1,331 @@
+<?php
+include_once(__DIR__."/constants");
+
+
+function isConsole(){
+    $sapi = php_sapi_name();
+    if($sapi == "cli"){ return true;}
+    else if($sapi == "fpm-fcgi"){ return false;}
+    else{
+        logger(LOG_WARNING, "Unknown php_sapi_name: $sapi");
+    }
+    return false;
+}
+
+function getDB($name = "main", $readOnly=true){
+
+        $dbFile= __DIR__."/../dbs/$name.db";
+        $init =false;
+        $init =true;
+        if(!file_exists($dbFile)){ 
+                //logger(LOG_INFO, "Creating new $name.db"); can't log here- causes infinite recursion loop on initial
+		$init=true; 
+	}
+        $db = new PDO("sqlite:$dbFile");
+        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $db->exec('PRAGMA journal_mode = wal;');
+        if($init ){
+                makeTables($db, $name);
+                setDefaults($db, $name);
+        }
+        return $db;
+}
+
+// make our db tables
+function makeTables($db, $name){
+        if($name == "main"){
+                $sql = "CREATE TABLE IF NOT EXISTS backups (id INTEGER PRIMARY KEY, guid TEXT, storageId INTEGER, timestamp INTEGER, sizeTotal INTEGER, sizeStored INTEGER, elapsed INTEGER, jobId INTEGER, type TEXT )";
+                $db->exec($sql);
+                $sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_backups on backups (guid, storageId, timestamp)";
+                $db->exec($sql);
+
+                $sql = "CREATE TABLE IF NOT EXISTS settings (key TEXT, val TEXT )";
+                $db->exec($sql);
+                $sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_settings on settings (key)";
+                $db->exec($sql);
+
+                $sql = "CREATE TABLE IF NOT EXISTS storage (id INTEGER PRIMARY KEY, guid TEXT, name TEXT, desc TEXT, type INTEGER, path TEXT, user TEXT, pass TEXT, context TEXT, options TEXT)";
+                $db->exec($sql);
+                $sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_storage on storage (path)";
+                $db->exec($sql);
+
+                // id guid name poolid type ip user pass agentJson cpu mem os role
+                $sql = "CREATE TABLE IF NOT EXISTS hosts (id INTEGER PRIMARY KEY, guid TEXT, name TEXT, poolid TEXT, type INTEGER, ip TEXT, username TEXT, password TEXT, agent TEXT, cpu INTEGER, memory INTEGER, os TEXT, role INTEGER)";
+                $db->exec($sql);
+                $sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_hosts on hosts (guid)";
+                $db->exec($sql);
+
+                $sql = "CREATE TABLE IF NOT EXISTS targets (id INTEGER PRIMARY KEY, guid TEXT, name TEXT, poolid TEXT, type INTEGER, ip TEXT, agent TEXT, cpu INTEGER, memory INTEGER, os TEXT, size INTEGER)";
+                $db->exec($sql);
+                $sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_vms on targets (guid)";
+                $db->exec($sql);
+
+                $sql = "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY, name TEXT, type INTEGER, status INTEGER, start INTEGER, end INTEGER, totalSize INTEGER, totalStored INTEGER, progress INTEGER, options TEXT, targets TEXT)";
+                $db->exec($sql);
+                //$sql = "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs on jobs (name)";
+                //$db->exec($sql);
+
+                $sql = "CREATE TABLE IF NOT EXISTS definitions (id INTEGER PRIMARY KEY, name TEXT, type INTEGER,  options TEXT, targets TEXT)";
+                $db->exec($sql);
+
+        }else if ($name == "joblog"){                
+                //      id, timestamp, elapsed jobid, guid, level, progress, text
+                $sql = "CREATE TABLE IF NOT EXISTS joblog (id INTEGER PRIMARY KEY, timestamp INTEGER,elapsed INTEGER, jobId INTEGER, guid TEXT, level INTEGER, progress INTEGER, text TEXT )";
+                $db->exec($sql);
+        }
+        auditLog("Created tables for DB $name");
+}
+
+function setDefaults($db, $name){
+        if($name == "main"){
+                $sql ="INSERT OR IGNORE INTO settings (key, val) VALUES (?, ?)";
+                $st = $db->prepare($sql);
+                $st->execute(array("blocksize","4"));
+                $st->execute(array("baseShare","/mnt/raw"));
+                $st->execute(array("baseStorage","/mnt/storage"));
+                $st->execute(array("logLevel",LOG_INFO));
+                $st->execute(array("autoCreateDs","1"));
+                $st->execute(array("defaultCbt","0"));
+                $st->execute(array("defaultRetention","5"));
+                $st->execute(array("agentApiKey","secret_agent_key"));
+                $st->execute(array("apiKey","secret_server_key"));
+                //$st->execute(array("serverIP","127.0.0.1"));
+        }
+}
+
+function dbSet($name, $sql, $params = []){
+                $db = getDB($name, false);
+                $st = $db->prepare($sql);
+                $st->execute($params);
+                return $db->lastInsertId();
+}
+function dbGet($name, $sql, $params = []){
+                $db = getDB($name, true);
+                $st = $db->prepare($sql);
+                $st->execute($params);
+                return $st->fetchAll(PDO::FETCH_OBJ);
+}
+function dbGetArray($name, $sql, $params = []){
+                $db = getDB($name, true);
+                $st = $db->prepare($sql);
+                $st->execute($params);
+                $all = $st->fetchAll();
+                $out = array();
+                foreach($all as $a){
+                        if(isset($a[0])){
+                                array_push($out, $a[0]);
+                        }
+                }
+                return $out;
+}
+
+function dbGetOne($name, $sql, $params = []){
+        $res = dbGet($name, $sql, $params);
+        if(count($res) >=1){
+                return $res[0];
+        }else{ return null; }
+}
+function dbGetColumn($name, $sql, $params = []){
+                $db = getDB($name, true);
+                $st = $db->prepare($sql);
+                $st->execute($params);
+                return $st->fetchColumn();
+}
+
+
+
+function colorize($text, $color){
+        $code = "";
+        switch ($color){
+                case "red":
+                        $code="\033[1;31m";
+                        break;
+                case "green":
+                        $code="\033[1;32m";
+                        break;
+                case "yellow":
+                        $code="\033[1;33m";
+                        break;
+                case "blue":
+                        $code="\033[1;34m";
+                        break;
+                case "grey":
+                        $code="\033[0;37m";
+                        break;
+                default:
+                        $code ='';
+        }
+        $out = $code."$text"."\033[0m";
+
+        return $out;
+}
+
+function getProgress($sFile, $loglet){
+        $pid = pcntl_fork();
+        if($pid ==0) {
+                $prog = 0;
+                $width =0;
+                if (isConsole()){                 
+                        $width =  (int) exec('tput cols');
+                }                
+                while($prog <100){
+                        if(!file_exists($sFile)){
+                                echo "\r$sFile not found!";
+                        }else{
+                                $st = json_decode(file_get_contents($sFile));
+                                if (isset($st->Progress)){
+                                        $prog = intval(trim($st->Progress));
+                                        if (isConsole()){
+                                                $pos = (int) ($width * ($prog / 100));
+
+                                                $bar = str_repeat('#', $pos % $width);
+                                                $bar .= str_repeat(' ', $width - strlen($bar));
+                                                $p = "\033[32m[$prog%]\033[0m";
+                                                $plen = strlen($p);
+                                                //$len = strlen($bar);
+                                                $middle = floor($width / 2);
+                                                $newBar = substr_replace($bar, $p, $middle - ($plen /2), $plen);
+                                                fwrite(STDOUT, "\r" . $newBar);
+                                                fflush(STDOUT);                                        
+                                        }
+                                        $loglet->setProgress($prog);
+                                }
+                        }
+                        usleep(500000);
+                }
+            
+
+            exit(0);
+        }
+    
+        return $pid;
+    }
+
+###############################
+function xenCmd($ip, $user, $pass, $cmd){
+	$wraped = "python ".__DIR__."/../scripts/xenWrapper $ip $user \"$pass\" $cmd";
+    $dbg = "Full call:$wraped";
+        logger(LOG_DEBUG, $dbg);
+	exec($wraped, $out, $code);
+	if($code != 0){
+		throw new Exception("XenAPI returned non-zero code: ".print_r($out,true));
+	}
+//print_r($out);
+	$out = implode("\n", $out);
+	$obj = json_decode($out);
+	if(isset($obj->result) && $obj->result == "error"){
+		throw new Exception($obj->message);
+	}
+	return $obj;
+}
+// for accessing cloud storage.  used by Storage and DS classes
+function runCloudTool($cmd, $confPath){
+        $base = __DIR__."/../bin/cloudtool -c $confPath $cmd";
+        logger(LOG_DEBUG, "Running: $base");
+        exec($base, $out, $code);
+        $dumb = implode('', $out);
+        $out = json_decode($dumb );
+        if($code != 0){
+                throw new Exception("Failed to run cloudtool (code $code) ". print_r($out, true)  );
+        }
+        return $out;
+}
+
+function auditLog($msg, $user="admin"){        
+        $entry = date('M d H:i:s', strtotime('now UTC')) ." [$user] $msg\n";        
+        $logFile = __DIR__."/../../logs/audit.log";
+        if(!file_exists($logFile)){
+                touch($logFile);
+        }
+        $logFH = fopen($logFile, 'r+');
+        if (flock($logFH, LOCK_EX | LOCK_NB)) {
+                file_put_contents($logFile, $entry, FILE_APPEND);
+        }else{
+                echo "Failed to get log flock\n";
+        }
+        fclose($logFH);        
+}
+
+function logger($lvl, $msg){
+
+        if(!isset($GLOBALS['logLevel'])){                
+                $GLOBALS['logLevel'] = getSetting("logLevel");  // be kind to our db only only hit this once per execution   
+        }
+        if ($lvl > $GLOBALS['logLevel']){  return; }
+
+        $entry = date('M d H:i:s', strtotime('now UTC')) ." [$lvl] $msg\n";
+        if(isConsole()){
+	        $out = colorize(date('M d H:i:s', strtotime('now UTC')), "grey");
+                if($lvl == LOG_WARNING){ $out .= colorize(" [$lvl] $msg", "yellow"); }
+                else if($lvl == LOG_ERR){ $out .= colorize(" [$lvl] $msg", "red"); }
+                else if($lvl == LOG_INFO){ $out .= colorize(" [$lvl] $msg", "blue"); }
+                else if($lvl == LOG_DEBUG){ $out .= colorize(" [$lvl] $msg", "grey"); }
+                echo "$out\n";
+        }       
+        $logFile = __DIR__."/../../logs/app.log";
+        if(!file_exists($logFile)){
+                touch($logFile);
+        }
+        $logFH = fopen($logFile, 'r+');
+        if (flock($logFH, LOCK_EX | LOCK_NB)) {
+                file_put_contents($logFile, $entry, FILE_APPEND);
+        }else{
+                echo "Failed to get log flock\n";
+        }
+        fclose($logFH);        
+}
+
+function makeGuid(){
+        return sprintf('%04X%04X-%04X-%04X-%04X-%04X%04X%04X', mt_rand(0, 65535), mt_rand(0, 65535), mt_rand(0, 65535), mt_rand(16384, 20479), mt_rand(32768, 49151), mt_rand(0, 65535), mt_rand(0, 65535), mt_rand(0, 65535));
+}
+
+function prettyBytes($bytes) {
+        $units = array('B', 'KB', 'MB', 'GB', 'TB');
+        $i = 0;
+        while ($bytes >= 1024 && $i < 4) {
+                $bytes /= 1024;
+                $i++;
+        }
+        return round($bytes, 2) . ' ' . $units[$i];
+}
+
+function getServerIP(){
+        $ip = getSetting("serverIP");        
+        if(empty($ip)){
+                $hostname = gethostname(); // Get the hostname of the server
+                $ip = gethostbyname($hostname);
+        }
+        return $ip;
+}
+
+function sendAlerts($msg){
+        $useDiscord = getSetting("discordAlerts");
+        if(empty($useDiscord) || $useDiscord == false){
+                return;
+        }
+        return discordMsg($msg);
+}
+
+function discordMsg($msg) {        
+        $webhook = getSetting("discordWebhook");
+        if ($webhook == "") {
+                logger(LOG_WARN,"Attempted to send Discord message, but no webhook is defined.");
+                return;
+        }
+        $payload = new stdClass();
+        $payload->username = APP_NAME." Guy";
+        $payload->content = $msg;
+        
+        $ch = curl_init($webhook);
+        $msg = "payload_json=" . urlencode(json_encode($payload));
+        if (isset($ch)) {
+                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $msg);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                $result = curl_exec($ch);
+                curl_close($ch);
+                return $result;
+        }        
+}
+
+?>

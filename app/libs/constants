@@ -1,0 +1,33 @@
+<?php
+
+// App name
+define('APP_NAME',"Banana_Backup");
+
+// platform consts
+define('XEN',2);
+define('HV',3);
+define('PROXMOX',4);
+define('AGENTWIN',10);
+
+// Job consts
+define('BACKUP',1);
+define('MIRROR',2);
+define('RESTORE',3);
+define('PURGE',4);
+
+
+// Typo consts
+define('LOG_WARN',LOG_WARNING);
+define('LOG_ERROR',LOG_ERR);
+
+
+// Status Constants
+define('PENDING', 0);
+define('ACTIVE', 1);
+define('COMPLETE', 2);
+define('COMPLETE_WARN', 3);
+define('COMPLETE_ERR', 4);
+define('FAILED', 5);
+define('CANCEL', 6);
+
+?>

@@ -1,0 +1,304 @@
+#!/usr/bin/php -q
+<?php
+
+include_once(__DIR__."/../libs/main_lib");
+include_once(__DIR__."/../libs/ds_lib");
+
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+
+if($argc < 2){ usage(); }
+
+$guid = "";
+$storageId= 0;
+$version=0;
+
+function usage(){
+    echo "Usage: -s <storageId> -g <guid>\n";	
+	echo "Note: Only GFS retention will be processed.  If a DS has the 'retention' set to anything BUT 0, it will be skipped\n";
+	echo "\n";
+	exit(1);
+}
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-s"){
+		if($argc > $i){
+			$i++;
+			$storageId= $argv[$i];
+		}	
+	}else if($argv[$i] == "-g"){
+		if($argc > $i){
+			$i++;
+			$guid = $argv[$i];
+		}	
+	}
+}
+if( $storageId==0 || empty($guid)){
+	usage();
+	exit();
+}
+/* 
+if(!file_exists($jobJson)){
+	logger(LOG_ERR,"Job config file ($jobJson) not found");
+	exit(1);
+}
+$j = json_decode(file_get_contents($jobJson));
+if ($j === null && json_last_error() !== JSON_ERROR_NONE) {
+	logger(LOG_ERR,"Failed to parse job config file ($jobJson)");
+	echo "Failed to parse job config: $jobJson\n";
+	exit(1);
+} */
+
+
+// TODO: 
+//      We need to detect and exit if any other jobs (backup, mirror, restore, etc) are working on this DS.
+//      Grab the deleteLock early?
+//
+//      We need some semblance of a job cancellation- purge can take a very long time, esp. against S3
+
+$j = new stdClass();
+$ds = null;
+
+try{
+	
+    $j->dryRun = false;
+
+	$j->id = rand(1,1000);
+    $j->prune = true;       // mark data for death (apply gfs)
+    $j->purge = true;      // delete marked backups
+
+	Joblog::setup($j->id, $storageId);
+
+    /// let's pretend some data for now
+    $gfs = new stdClass();
+    $gfs->daily = 5;
+    $gfs->weekly = 1;
+    $gfs->monthly = 1;
+    $gfs->yearly = 1;
+
+    $st = getStorage($storageId);	// throws if it doesn't exist
+
+    $lg = Joblog::getLoglet("Performing GFS rotation on DS $guid ($st->name)", LOG_INFO);
+    if($j->dryRun){
+        $lg->setText("Performing GFS rotation on DS $guid ($st->name) -- Dry run only");        
+    }
+	
+	$topLog = Joblog::getLoglet("Beginning GFS retention job for Storage $st->name", LOG_INFO);
+	$st->mount();		
+
+    $ds = getDS($storageId, $guid);
+    $ds->acquireDeleteLock();
+    $dsInfo = $ds->getInfo();    
+
+    // should we reconsile between local (db)/remote (ds) backup lists?  The DS is the authority on what really exists
+    //$backups = $ds->listBackups();
+
+    // Now we run the GFS calculations to promote and drop backups as configured
+    // Backups being deleted will only be marked in the DB as 'purge' by this function
+    // The GC work will take the list of to-be purged backups and actually drop the backup data
+    $backupsToDelete =[];
+    if($j->prune){                            
+        $backupsToDelete = doPrune($ds, $j,$gfs, $storageId, $guid);
+    }else{
+        echo "Skipping prune\n";
+        // we didn't run prune, so just check the DB for work to do
+        $backupsToDelete = dbGetArray("main", "SELECT timestamp from backups where guid=? and storageId=? and type=? ", array($guid, $storageId, "purge"));  
+    }
+
+    $topLog->setProgress(20);    
+
+    if($j->purge){
+        $stats = doPurge($backupsToDelete, $ds, $dsInfo, $j);    // actually remove data from the system
+        $sz = $stats->blocksPurged * $dsInfo->blocksize;
+        $msg = "GFS job deleted $stats->backupsPurged backups, and approximately $sz data";
+        sendAlerts($msg);
+    }else{
+        echo "Skipping purge\n";
+    }
+
+	$topLog->setProgress(100);
+    if($j->dryRun){
+        Joblog::log(LOG_INFO,"Dry run only- no backups were deleted");        
+    }
+	$st->unmount();
+
+}catch(Exception $ex){
+	logger(LOG_ERR, $ex->getMessage() );
+    $msg = "Error during GFS job:". $ex->getMessage();
+	Joblog::log(LOG_ERR,$msg);
+    sendAlerts($msg);
+	exit(1);
+}finally{
+    if(is_object($ds) ){
+        $ds->unmount();
+    }
+}
+
+function doPrune($ds, $j, $gfs, $storageId, $guid){    
+
+    // Should we filter on only those marked with a type='gfs'?
+    $backups = dbGet("main", "SELECT * from backups where guid=? and storageId=? order by timestamp desc", array($guid, $storageId));    
+        
+    $yearly = [];
+    $monthly = [];
+    $weekly = [];
+    $daily = [];
+
+    $allBackups =[];
+    $lg = Joblog::log(LOG_INFO,"Found ".count($backups)." to process");
+
+    foreach($backups as $b){
+        
+        array_push($allBackups, $b->timestamp);
+
+        $year = date('Y', $b->timestamp);
+        $month = date('n', $b->timestamp);
+        $day = date('j', $b->timestamp);
+
+        // Let's make some keys for easy sorting
+        $yearlyKey = $year;
+        $monthlyKey = $year . '-' . $month;
+        $weeklyKey = date('o-W', $b->timestamp);
+        $dailyKey = $year . '-' . $month . '-' . $day;
+
+        //echo "($b->timestamp) year: $year - month: $month - day: $day|  $yearlyKey, $monthlyKey, $weeklyKey, $dailyKey\n";     
+        
+        // Promote the yearly first, as they take priority
+        if (!isset($yearly[$yearlyKey])) {
+            if (count($yearly) < $gfs->yearly) {
+                $yearly[$yearlyKey] = $b->timestamp;
+                continue;
+            } else {
+                $oldest = key(array_slice($yearly, 0, 1, true));
+                if ($b->timestamp > $yearly[$oldest]) {
+                    unset($yearly[$oldest]);
+                    $yearly[$yearlyKey] = $b->timestamp;
+                    continue;
+                }
+            }
+            
+        }
+        // Next, do the monthly
+        if (!isset($monthly[$monthlyKey])) {
+            if (count($monthly) < $gfs->monthly) {
+                $monthly[$monthlyKey] = $b->timestamp;
+                continue;
+            } else {
+                $oldest = key(array_slice($monthly, 0, 1, true));
+                if ($b->timestamp > $monthly[$oldest]) {
+                    unset($monthly[$oldest]);
+                    $monthly[$monthlyKey] = $b->timestamp;
+                    continue;
+                }
+            }
+        }
+        // And weekly's turn
+        if (!isset($weekly[$weeklyKey])) {
+            if (count($weekly) < $gfs->weekly) {
+                $weekly[$weeklyKey] = $b->timestamp;
+                continue;
+            } else {
+                $oldest = key(array_slice($weekly, 0, 1, true));
+                if ($b->timestamp > $weekly[$oldest]) {
+                    unset($weekly[$oldest]);
+                    $weekly[$weeklyKey] = $b->timestamp;
+                    continue;
+                }
+            }
+        }
+        // Lastly, the daily 
+        if (!isset($daily[$dailyKey])) {
+            if (count($daily) < $gfs->daily) {
+                $daily[$dailyKey] = $b->timestamp;
+            } else {
+                $oldest = key(array_slice($daily, 0, 1, true));
+                if ($b->timestamp > $daily[$oldest]) {
+                    unset($daily[$oldest]);
+                    $daily[$dailyKey] = $b->timestamp;
+                }
+            }
+        }
+    }
+    /*     print_r($daily);
+    print_r($weekly);
+    print_r($monthly);
+    print_r($yearly); */
+
+    $allGfs = [];
+    foreach($yearly as $y => $ts){
+        $lg = Joblog::log(LOG_INFO,"Promoting backup from ".date('m/j/Y H:i', $ts)." to yearly");
+        if ($j->dryRun == false){
+            dbSet("main", "UPDATE backups set type=? where guid=? and storageId=? and timestamp=?", array('yearly', $guid, $storageId, $ts));
+        }
+        array_push($allGfs, $ts);
+    }
+    foreach($monthly as $m => $ts){
+        $lg = Joblog::log(LOG_INFO,"Promoting backup from ".date('m/j/Y H:i', $ts)." to monthly");
+        if ($j->dryRun == false){
+            dbSet("main", "UPDATE backups set type=? where guid=? and storageId=? and timestamp=?", array('monthly', $guid, $storageId, $ts));
+        }
+        array_push($allGfs, $ts);
+    }
+    foreach($weekly as $w => $ts){
+        $lg = Joblog::log(LOG_INFO,"Promoting backup from ".date('m/j/Y H:i', $ts)." to weekly");
+        if ($j->dryRun == false){
+            dbSet("main", "UPDATE backups set type=? where guid=? and storageId=? and timestamp=?", array('weekly', $guid, $storageId, $ts));
+        }
+        array_push($allGfs, $ts);
+    }
+    foreach($daily as $d => $ts){
+        $lg = Joblog::log(LOG_INFO,"Promoting backup from ".date('m/j/Y H:i', $ts)." to daily");
+        if ($j->dryRun == false){
+            dbSet("main", "UPDATE backups set type=? where guid=? and storageId=? and timestamp=?", array('daily', $guid, $storageId, $ts));
+        }
+        array_push($allGfs, $ts);
+    }
+
+    $doomed = array_diff($allBackups, $allGfs); // these are all the unmarked backups.
+
+    Joblog::log(LOG_INFO,"Found ".count($doomed)." backups to purge, and ". count($allGfs)." to retain.");
+    if ($j->dryRun == false){
+        foreach($doomed as $d){
+            dbSet("main","UPDATE backups set type=? where guid=? and storageId=? and timestamp=? ", array('purge',$guid,$storageId, $d));
+        }
+    }
+
+    echo "\nJob: $j->id\n";
+    // pull all the 'purge' status guys out from DB, in case we missed some last time around
+    $realDoomed = dbGetArray("main", "SELECT timestamp from backups where guid=? and storageId=? and type=? ", array($guid, $storageId, "purge"));    
+    echo count($realDoomed) ." doomers\n";
+    return $realDoomed;
+}
+
+function doPurge($backupsToDelete, $ds, $dsInfo, $j){
+
+    $stats = new stdClass();
+    $stats->backupsPurged =0;
+    $stats->blocksPurged =0;
+    
+    print_r($j)  ;
+
+    foreach($backupsToDelete as $purge){
+        $lg = Joblog::getLoglet("Purging backup $purge (".date('m/j/Y H:i', $purge).")", LOG_INFO);
+
+        $num = rand(0,200);
+        if($j->dryRun== false){            
+            $num = $ds->purge($purge);        // does this remove them from our DB?        
+        }
+        $stats->blocksPurged += $num;
+        $stats->backupsPurged++;
+        $bak = date('m/j/Y H:i', $purge);
+        $approx = $dsInfo->blocksize * $num;
+        $lg->setProgress(100);
+        $lg->setText("Purged backup $purge (".$bak."). $num blocks deleted [~$approx MB]", LOG_INFO);
+        echo "Purged backup: $purge ($bak)\n";
+        dbSet("main", "DELETE from backups where timestamp=? and guid=? and storageId=?", array($purge, $ds->guid, $ds->storageId));
+    }
+    return $stats;
+}
+
+
+?>

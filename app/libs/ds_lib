@@ -1,0 +1,862 @@
+<?php
+
+include_once(__DIR__."/main_lib");
+include_once(__DIR__."/common_lib");
+include_once(__DIR__."/storage_lib");
+
+
+
+class DsInfo{
+    public string $guid;
+    public string $name = "DS Name";
+    public int $blocksize =4;
+    public int $borndate = 0;
+    public string $compression = "zstd";
+    public int $cbtTs=0;
+    public int $cbtEnable=0;
+    public int $retention=5;
+    public function __construct(){}
+
+    public function create($guid, $name, $blocksize=4, $retain=5, $cbt=0) {
+        $this->guid = $guid;
+        $this->name = $name;
+        $this->blocksize = $blocksize;
+        $this->retention = $retain;
+        $this->cbtEnable = $cbt;
+        $this->borndate = time();
+    }
+    public function load($json){        
+        $dat = json_decode($json);
+
+        $this->guid = $dat->guid;
+        $this->name = $dat->name;
+        $this->blocksize = $dat->blocksize;
+        if(isset($dat->retention)){
+            $this->retention = $dat->retention;
+        }
+        if(isset($dat->cbtEnable)){
+            $this->cbtEnable = $dat->cbtEnable;
+        }
+        $this->cbtTs = $dat->cbtTs;
+        $this->compression = $dat->compression;
+        $this->borndate = $dat->borndate;        
+    }
+}
+
+function getDS(string $storageId, string $guid): DataStoreBase {
+    try{
+    $st = getStorage($storageId);        
+    if($st->type ==3){
+        return new DataStoreCloud($st, $guid);
+    }else{
+        return new DataStoreLocal($st, $guid);
+    }
+    }catch(Exception $ex){
+        throw new Exception("Failed to Load DS ($storageId $guid) with error: ". $ex->getMessage());
+    }
+}
+
+
+abstract class DataStoreBase {
+    protected $storage;
+    public readonly string $guid;
+    public int $type;
+    public int $storageId;
+
+    private $lockFile;
+    private $lockFH;
+
+    public function __construct($storage, $guid) {
+        $this->storage = $storage;
+        $this->guid = $guid;
+        $this->type = 0;
+        $this->storageId = $storage->id;
+        $this->info = null;
+
+        if($storage->type ==3){ $this->type =1; }   // cloud storage (type 3) is DS type 1 (not brilliant)
+
+        $this->lockFile = "/tmp/ds.".$this->storageId."_".$this->guid.".lck";
+        if (!file_exists($this->lockFile)) {
+            touch($this->lockFile);
+        }        
+        $this->acquireReadLock();
+        logger(LOG_DEBUG,"DS base ctor (read locked)");
+    }
+    public function __destruct() {
+        $this->releaseLock();
+        logger(LOG_DEBUG,"DS base dtor");
+    }
+
+    public function getPath(){ }
+    public function getSize(){ }
+    public function getInfo(){ }
+    public function setInfo($inf){}
+
+    public function create($name, $blockSize, $retain, $cbt) { }
+    private function makeDsDefaults($blockSize, $name){ }
+
+    public function exists() { return false; }
+    public function mount() { }
+    public function unmount() { }
+    public function isMounted() { }
+    
+    private function acquireReadLock() {
+        $this->lockFH = fopen($this->lockFile, 'r');
+        if ($this->lockFH === false) {
+            throw new Exception("Unable to open DS lock file for reading ($this->lockFile)");
+        }
+        if (flock($this->lockFH, LOCK_SH | LOCK_NB)) {            
+            logger(LOG_DEBUG,"DS read lock acquired $this->lockFile");
+            return true;
+        }
+        fclose($this->lockFH);
+        $this->lockFH = null;
+        throw new Exception("Failed to get read lock");
+        return false;
+    }
+    public function acquireDeleteLock() {
+        logger(LOG_DEBUG,"Getting DS delete lock  $this->lockFile");
+        //$this->releaseLock();
+        $this->lockFH = fopen($this->lockFile, 'r+');
+        if ($this->lockFH === false) {
+            throw new Exception("Unable to open DS lock file for writing ($this->lockFile)");
+        }
+        if (flock($this->lockFH, LOCK_EX | LOCK_NB)) {            
+            logger(LOG_DEBUG,"DS delete lock acquired $this->lockFile");
+            return true;
+        }
+        fclose($this->lockFH);
+        $this->lockFH = null;
+        throw new Exception("Failed to get delete lock for DS: $this->guid");
+        return false;
+    }
+    private function releaseLock() {
+        if ($this->lockFH) {
+            flock($this->lockFH,  LOCK_UN);            
+            fclose($this->lockFH);
+            $this->lockFH = null;            
+            logger(LOG_DEBUG,"DS lock released $this->lockFile");
+        }
+    }
+
+    // This is complex and dangerous so we implement it once for all DS types.
+    // While this is slightly less efficient as we can't use shortcuts per type, it will minimize dangerous bugs
+    //
+    // We are given a version (timestamp) to remove from our local DS
+    // 
+    //  we need to get a list of all (unique) blocks used by this version
+    //  and compare it to a unique list of all blocks of all the other backups
+    //  then we can delete any 'orphan' blocks, followed by the version folder w/ the metadata
+    //
+    public function purge($version) {
+        if(!$this->isMounted()){
+            throw new Exception("DS is not mounted");
+        }
+        
+        if(!$this->haveBackup($version)){
+            logger(LOG_INFO, "Backup $version not in DS.  Purging not possible.");
+            return;
+        }        
+        logger(LOG_INFO, "Purging backup $version on $this->guid");
+        $workDir = "/tmp/purge.vers.". rand(0,2000);        
+        exec("mkdir -p $workDir");
+
+	    $numBlocksDeleted=0;	// for science
+        
+        try{
+		$this->acquireDeleteLock();
+            
+            // cat uniq all hcls from $vers to file
+            $killme = "$workDir/killme";
+            $dontkillus = "$workDir/dontkill";
+            $purgeBlockFile = "$workDir/purgeBlocks";
+
+            logger(LOG_DEBUG, "Listing version: $version");
+            $delVerFiles = $this->listFiles($version);
+            $cnt =0;
+            foreach($delVerFiles as $f){
+                $parts = pathinfo($f);
+                if($parts['extension'] == "hcl"){                
+                    $this->getFile("/$version/$f","$workDir/$cnt.dcl");
+                    $cnt++;
+                }
+            }
+            if($cnt ==0){ 
+                logger(LOG_INFO, "Nothing to be purged.");
+                return;
+            }
+            
+            $cmd = "cat $workDir/*.dcl | sed 's/CODA//' | sort -u  > $killme";
+            logger(LOG_DEBUG, "Running $cmd");
+            exec($cmd);
+            exec("rm $workDir/*.dcl");      // cleanup
+            
+            $all = "";        
+            $versions = $this->listBackups();   // array of epoch ts
+
+            foreach ($versions as $v){            
+                if($v == "$version"){               
+                    continue;           //echo "Don't collect ourselves! ($v)\n";
+                }
+                $files = $this->listFiles($v);            
+                foreach($files as $f){
+                    $parts = pathinfo($f);
+                    if($parts['extension'] == "hcl"){
+                        $this->getFile("/$v/$f","$workDir/$v.$f");                    
+                    }
+                }
+            }
+            $cmd = "cat $workDir/*.hcl | sed 's/CODA//' | sort -u  > $dontkillus";    // this will give us all the hcls for all backups we want to keep
+            
+            /* if(empty(trim($all))){
+                $cmd = "touch $dontkillus";	// there are no other versions
+                echo "Is this the last version stored?  Delete the whole QDS\n";
+                return false;
+            } */
+            logger(LOG_DEBUG, "Running $cmd");
+            exec($cmd);    
+            logger(LOG_DEBUG, "Cleaning hcls");
+            exec("rm $workDir/*.hcl");        
+            $cmd= "comm -23 $killme  $dontkillus > $purgeBlockFile";
+            logger(LOG_DEBUG, "Running $cmd");
+            exec($cmd);
+
+            foreach(file($purgeBlockFile) as $line) {
+                try{
+                    $block = trim("/blocks/" . substr($line, 0, 3) ."/$line");            
+                    $this->deleteFile($block);
+                    logger(LOG_DEBUG, "Deleted Block: $block");
+			$numBlocksDeleted++;
+                }catch(Exception $ex){
+                    logger(LOG_WARNING, "Failed to delete block $block ". $ex->getMessage());
+                }
+            }
+            logger(LOG_INFO, "Removing the version: $version");
+
+            foreach($delVerFiles as $item){                
+                $this->deleteFile("/$version/$item");
+                logger(LOG_DEBUG, "Deleted file: /$version/$item");
+            }
+            $this->deleteFile("/$version");
+            logger(LOG_DEBUG, "Deleted this folder: $version");
+            
+        }finally{        
+		$this->releaseLock();
+            $cmd = "rm -fr $workDir";
+            logger(LOG_DEBUG, "Removing workdir: $cmd");
+            exec($cmd);
+        }
+        auditLog("Purged backup $version on $this->guid ($numBlocksDeleted blocks deleted)");
+	    return $numBlocksDeleted;
+    }
+
+    public function haveFile($remotePath) { }
+    public function getBackupInfo($ts) {  }
+    public function haveBackup($ts) { }
+
+    public function getFile($remotePath, $targetPath) { }
+    public function getFileContents($remotePath) { }
+    public function putFile($sourcePath, $remotePath) { }
+    public function deleteFile($remotePath) { }
+
+    public function listBackups() { }
+    public function listFiles($versionPath) { }
+
+    protected function ensureSlash(string $path): string {
+        if ($path === '' || $path[0] !== '/') { return '/'. $path; }
+        return $path;
+    }
+}
+
+class DataStoreLocal extends DataStoreBase {
+	private $localPath = "";
+	private $rawBase = "";			// default: /mnt/raw
+	private $dsBase = "";           // default: /mnt/storage
+    private $qcowPath = "";
+
+    public function __construct($storage, $guid) {
+        parent::__construct($storage, $guid);
+        $this->rawBase = getSetting("baseShare") ;
+        $this->dsBase = getSetting("baseStorage");
+
+        $this->type = 0;
+        $this->localPath = "$this->dsBase/".$storage->id ."/$guid";
+        
+        if($storage->type ==0){
+            $this->rawBase = $this->storage->path;
+            $this->qcowPath = $this->rawBase ."/".$this->guid.".qds";
+        }else{
+            $this->qcowPath = $this->rawBase ."/$storage->id/".$this->guid.".qds";
+        }
+    }
+
+    public function __destruct(){
+        logger(LOG_DEBUG,"DS (local) dtor ($this->guid)");
+        parent::__destruct();
+    }
+	
+    // we already have our $guid and $storage from the $ctor
+    //
+    //  We need to:
+    //      make a QC repo file
+    //      Mount the QC via qemu-nbd
+    //      Format the nbd device w/ btrfs
+    //      Create the default folder structure & set permissions
+    //      Create the initial ds.json with our blocksize, guid, etc
+    public function create($name, $blockSize, $retain, $cbt) {
+
+        $lp = "$this->rawBase/$this->storageId";
+        if($this->storage->type ==0){
+            $lp = $this->storage->path;
+        }else{
+            exec("mkdir -p $lp");
+            $this->storage->mount();
+        }
+
+        if(file_exists($this->qcowPath)){
+            throw new Exception("DS file already exists: $this->qcowPath");
+        }
+        
+        exec("mkdir -p ". dirname($this->qcowPath));
+        
+	    logger(LOG_DEBUG,"Making Qcow DS on file: $this->qcowPath");
+        $cmd = "qemu-img create -f qcow2 -o compression_type=zstd $this->qcowPath 16T";	// make it as big as most common fs can handle (ext4, I'm looking at you)
+
+        $res = exec($cmd, $out, $code);		// should throw
+        if($code !=0){
+            $outStr = implode('', $out);
+            throw new Exception("Failed to create Qcow image file: $outStr");
+        }
+        logger(LOG_DEBUG,"Made qcow ($cmd): $res");
+
+        $nbd= null;
+        try{
+            $nbd = mountQC($this->qcowPath );		// should throw            
+            $cmd = "sudo mkfs.btrfs -f $nbd 2>&1";
+            logger(LOG_DEBUG,"Running $cmd");
+            exec($cmd, $out, $code);		// should throw
+            if($code != 0){
+                throw new Exception("Failed to format QC file :". print_r($out, true));
+            }
+            exec("mkdir -p $this->localPath");
+            mountDSFS($this->localPath, $nbd);	// should throw
+
+            $this->makeDsDefaults($blockSize, $name);
+            
+            $dat = new DsInfo();
+            $dat->create($this->guid, "DS for $name", $blockSize, $retain, $cbt);
+            //$dat = makeDSDat($this->guid, $blockSize, $this->storage->name, "DS for $name", $retain, $cbt );
+		    file_put_contents("$this->localPath/ds.json",json_encode($dat));
+            $this->storage->addDS($this->guid);     // tell our Storage to record us in their json
+
+        }catch(Exception $ex){
+                if($nbd != null){
+                    logger(LOG_DEBUG,"Unplugging $nbd");
+                    $cmd = "sudo nbd-client -L -d $nbd ";
+                    $res = shell_exec($cmd);
+                }
+                unlink($this->qcowPath);
+
+            throw new Exception($ex->getMessage() );
+        }
+        auditLog("Created DS ($name)");
+    }
+    private function makeDsDefaults($blockSize, $name){
+	    $cmd = "sudo chown -R 1000:1000 $this->localPath";
+	    $res = shell_exec($cmd);
+	    logger(LOG_DEBUG, "Chown res: $res");
+	    $cmd = "mkdir $this->localPath/blocks";
+	    $res = shell_exec($cmd);
+
+	    for ($i = 0; $i < 4096; $i++) {
+		    $dirName = "$this->localPath/blocks/". sprintf('%03x', $i);
+		    if (!is_dir($dirName)) {
+			    mkdir($dirName, 0777, true);
+		    }
+	    }
+		exec("chown -R 1000:1000 $this->localPath");    // make our user own everything
+
+		
+	}
+
+    public function getPath(){ 
+        return $this->localPath;
+    }
+    public function getSize(){ 
+    	$base = "$this->rawBase/$this->storageId";
+	if($this->storage->type ==0){
+		$base = "$this->rawBase";
+	}
+        $sz = trim(shell_exec("du -hs $this->qcowPath | cut -f1"));
+        return $sz;
+    }
+    public function getInfo(){ 
+        if(!$this->isMounted()){
+            logger(LOG_WARNING, "DS $this->guid not mounted, can't get dsInfo");
+            return;
+        }
+        if($this->info == null){
+            echo "Loading dsInfo cache\n";
+            $this->info = new DsInfo();
+            $this->info->load($this->getFileContents("/ds.json"));
+        }else{
+            echo "Using cached dsInfo\n";
+        }
+        return $this->info;
+    }
+    public function setInfo($inf){ 
+        if(!$this->isMounted()){
+            logger(LOG_WARNING, "DS $this->guid not mounted, can't write dsInfo");
+            return;
+        }
+        if(empty($inf)){ 
+            logger(LOG_ERR, "Failed to setInfo on DS ($this->$storageId:$this->guid)-- info provided was blank");
+            return;
+        
+        $this->info = $inf;}
+        return file_put_contents("$this->localPath/ds.json",json_encode($inf));
+    }
+
+    // How can you test this?
+    // The share needs to be mounted/available before we can see if a .qds file exists.
+    public function exists() {         
+        echo "Testing $this->qcowPath\n";
+        if(file_exists($this->qcowPath)){
+            return true;
+        }
+        return false;
+    }
+
+	// Mounts the share, then the DS image depending on the the storage type
+	// type 0:	local disk (no mounting)
+	// type 1 & 2:	nfs & cifs, need mounting
+    public function mount() {
+        if($this->isMounted()){
+            logger(LOG_DEBUG, "DS $this->guid is already mounted");
+            return;
+        }
+
+
+        $storPath = "$this->dsBase/$this->storageId/$this->guid";
+        exec("mkdir -p $storPath");
+
+        $lp = "$this->rawBase/$this->storageId";
+        if($this->storage->type ==0){
+            $lp = $this->storage->path;
+        }else{
+            exec("mkdir -p $lp");
+            $this->storage->mount();
+        }
+        $qds = "$lp/$this->guid.qds";
+
+        // let's try mounting the DS file now
+            if(!file_exists($qds)){
+                    //$res =makeDSQC($qds, $storPath, $share);
+            throw new Exception("Could not find DS file ($qds)");
+            }
+        $nbd = mountQC($qds);
+        if($nbd === false){ throw new Exception("Failed to mount DS image file ($qds)"); }
+        try{
+            mountDSFS($storPath , $nbd);
+        }catch(Exception $ex){
+            logger(LOG_ERR,"Failed to mount DS filesystem ($qds): ". $ex->getMessage() );
+            $cmd = "sudo /usr/bin/qemu-nbd -d $nbd ";
+            $res = shell_exec($cmd);
+            if($this->storage->type !=0){
+                $this->storage->unmount($lp, $this->storageId);
+            }
+            throw new Exception($ex->getMessage());
+        }
+        
+    }
+
+    public function unmount() {
+	// check if mounted?
+	if(!$this->isMounted()){
+		logger(LOG_DEBUG, "DS $this->guid is not mounted, can't unmount");
+		return;
+	}
+
+
+	$cmd = "findmnt -n -o SOURCE $this->localPath";
+        $nbd = trim(shell_exec($cmd));
+        logger(LOG_DEBUG, "Detected nbd: $nbd for $this->localPath path");
+        //echo "$cmd\n";
+        logger(LOG_DEBUG, "Unmounting nbd:$nbd for $this->localPath");
+        $cmd = "sudo fstrim -v $this->localPath";
+        $res = shell_exec($cmd);
+        logger(LOG_DEBUG, "FStrim: $res");
+        $cmd = "sudo umount $this->localPath";
+        $res = shell_exec($cmd);        
+        $cmd = "sudo /usr/bin/qemu-nbd -d $nbd ";
+        $res = shell_exec($cmd);
+
+	// unmount the share if we're networky
+	if($this->storage->type !=0){
+		$this->storage->unmount("$this->rawBase/$this->storageId", $this->storageId );
+	}
+}
+
+    public function isMounted() {
+        if(empty($this->localPath)){ return false;}
+
+        $js = $this->localPath ."/ds.json";
+        if(!file_exists($js)){
+            logger(LOG_DEBUG, "DS $this->guid: ds.json doesn't exist ($js), so we don't appear to be mounted");
+            return false;
+        }
+        $obj = json_decode(file_get_contents($js));
+        if($obj->guid != $this->guid){
+            logger(LOG_INFO, "Obj guid ($this->guid) doesn't match DS guid ($obj->guid)");
+            return false;
+        }
+        return true;
+    }
+
+
+    // Their path should be relative to the DS root.  Eg. "/<ts>/0.hcl"
+    public function haveFile($remotePath) {
+        $remotePath = parent::ensureSlash($remotePath);  // ensure it starts with a /
+        $tp = $this->localPath ."$remotePath";        
+        if(file_exists($tp)){ return true; }
+        return false;
+    }
+
+    // essentially a copy
+    // If targetPath is a folder (ending in a /), it will copy the same name    <-- dir must exist!
+    // If it is a filename, that will be the destination name
+    public function getFile($remotePath, $targetPath) {
+        $remotePath = parent::ensureSlash($remotePath);  // ensure it starts with a /
+
+        $src = $this->localPath ."$remotePath";
+        if(!file_exists($src)){ throw new Exception("File doesn't exist: $src");}
+
+        if(str_ends_with($targetPath, '/')){
+            // they gave us a directory
+            if(!is_dir($targetPath)){
+                throw new Exception("Target dir doesn't exist for get: $targetPath");
+            }
+        }else{
+            if(!is_dir(dirname($targetPath) )){
+                throw new Exception("Target dir path doesn't exist for get: ". dirname($targetPath));
+            }
+        }
+
+        if (!copy($src, $targetPath )){
+            $error = error_get_last();
+            logger(LOG_ERR, "DS $this->guid: getFile $remotePath -> $targetPath failed. Error: " . $error['message']);
+        }
+    }
+
+    // return the contents of the remote file, instead of copying to a path
+    public function getFileContents($remotePath) {
+        $remotePath = parent::ensureSlash($remotePath);  // ensure it starts with a /
+        $src = $this->localPath ."$remotePath";
+        if(!file_exists($src)){ throw new Exception("File doesn't exist: $src");}
+
+        return file_get_contents($src);
+    }
+
+    // $remotePath is relative to the root of the DS (eg "/<ts>/0.hcl")
+    public function putFile($sourcePath, $remotePath) {
+        if(!file_exists($sourcePath)){ throw new Exception("Source file doesn't exist: $sourcePath");}
+
+        $remotePath = parent::ensureSlash($remotePath);  // ensure it starts with a /
+        $dst = $this->localPath ."$remotePath";  // prepend the actual mount path
+        $dst = rtrim($dst, '/');
+        $dst .= '/';
+
+        // they gave us a directory
+        if(str_ends_with($remotePath, '/')){
+            if(!is_dir($remotePath)){
+                throw new Exception("Target dir doesn't exist for put: $remotePath");
+            }
+            $dst .= basename($sourcePath);
+        }else{            
+            if(!is_dir(dirname($dst) )){
+                mkdir(dirname($dst));
+            }
+            $dst = rtrim($dst, '/');
+        }
+        if (!copy($sourcePath, $dst )){
+            $error = error_get_last();
+            logger(LOG_ERR, "DS $this->guid putFile $sourcePath -> $remotePath failed. Error: " . $error['message']);
+        }
+    }
+
+    public function deleteFile($remotePath) {
+        $remotePath = parent::ensureSlash($remotePath);  // ensure it starts with a /
+        $dst = $this->localPath ."$remotePath";  // prepend the actual mount path
+
+        if(!file_exists($dst)){
+            throw new Exception("File doesn't exist, can't delete: $dst");
+        }
+        if(is_dir($dst)){
+            if (!rmdir($dst )){
+                $error = error_get_last();
+                logger(LOG_ERR, "DS $this->guid deleteFile (directory) $remotePath failed. Error: " . $error['message']);
+            }
+        }else if (!unlink($dst )){
+            $error = error_get_last();
+            logger(LOG_ERR, "DS $this->guid deleteFile $remotePath failed. Error: " . $error['message']);
+        }
+    }
+
+    public function listBackups() {
+
+        $allDirs = array_filter(glob($this->localPath . '/*'), 'is_dir');
+        $allDirs = array_map(function($ver) {
+            return basename($ver);
+        }, $allDirs);
+        $versions = array_filter($allDirs, function($dir) {
+                return is_numeric(basename($dir)) && strlen(basename($dir)) === 10;
+        });
+        
+        return $versions;
+    }
+
+    public function haveBackup($ts) { 
+        $verPath = $this->localPath ."/$ts";
+        if(!is_dir($verPath)){ return false; }
+        if(file_exists("$verPath/meta.json")){ return true; }
+        return false;
+    }
+
+    public function getBackupInfo($ts) { 
+        $verPath = $this->localPath ."/$ts";        
+        if(!file_exists("$verPath/meta.json")){ 
+            throw new Exception("No valid meta file found for backup");
+        }
+        return json_decode($this->getFileContents("$ts/meta.json"));
+    }
+
+    // List any files in a folder
+    // relative to the base (eg /<ts>/ )
+    public function listFiles($folder) {
+        $folder = parent::ensureSlash($folder);  // ensure it starts with a /
+        $dst = $this->localPath ."$folder";  // prepend the actual mount path
+
+        $files = array_filter(glob($dst . '/*'), 'is_file');
+        $out = array();
+        foreach($files as $f){
+            array_push($out, basename($f));
+        }
+        return $out;
+    }
+}
+
+###########################################################################################
+#   Cloud DS 
+#    
+#
+###########################################################################################
+
+class DataStoreCloud extends DataStoreBase {
+    private $isMounted = false;
+    public readonly string $bucket;
+    public readonly string $key;
+    public readonly string $secret;
+    public readonly string $region;
+    public readonly string $endpoint;
+
+    private string $confPath;
+
+    public function __construct($st, $guid) {
+        parent::__construct($st, $guid);
+        $this->isMounted = false;
+        $this->type = 1;
+        $this->bucket = $st->context;
+        $this->endpoint = $st->path;
+        $this->region = $st->options;
+        $this->key = $st->user;
+        $this->secret = $st->pass;
+        
+    }
+    public function __destruct(){
+        logger(LOG_DEBUG,"DS dtor ($this->guid)");
+        parent::__destruct();
+    }
+
+    private function makeConf(){
+        $obj = new stdClass();
+        $obj->Bucket = $this->bucket;
+        $obj->Endpoint = $this->endpoint;
+        $obj->Region = $this->region;
+        $obj->AccessKey = $this->key;
+        $obj->SecretKey = $this->secret;
+        $confTmp = tempnam("/tmp/", 'ds.tmp');
+        file_put_contents($confTmp, json_encode($obj));
+        return $confTmp;
+    }
+    private function doCloudCommand($cmd){
+        $tmp = $this->makeConf();
+        try{
+            $res = runCloudTool($cmd, $tmp);
+            return $res;
+        }finally{
+            unlink($tmp);
+        }
+    }
+
+    public function exists() { 
+        try{
+            $this->mount();
+            return true;
+        }catch(Exception $ex){
+            logger(LOG_ERR, "Failed to access DS in exists() : ". $ex->getMessage());
+        }
+        return false;
+    }
+
+    // we already have our $guid and $storage from the $ctor
+    public function create($name, $blockSize, $retain, $cbt) { 
+        $inf = null;
+            try{
+            $inf = $this->getInfo();
+        }catch(Exception $ex){}
+        if(is_object($inf)){ throw new Exception("DS $name already exists"); }
+
+        $this->makeDsDefaults($blockSize, $name, $retain, $cbt);
+        $this->storage->addDS($this->guid);     // tell our Storage to record us in their json
+        auditLog("Created DS ($name)");
+    }
+    private function makeDsDefaults($blockSize, $name, $retain, $cbt){ 
+	    //$dat = makeDSDat($this->guid, $blockSize, $this->storage->name, "Cloud DS for $name", $retain, $cbt );
+        $dat = new DsInfo();
+        $dat->create($this->guid, "Cloud DS for $name", $blockSize, $retain, $cbt);
+        $this->setInfo($dat);
+    }
+
+    public function getPath(){ 
+        return $this->guid."/";
+    }
+    public function getSize(){ 
+        return "N/A";
+    }
+    public function getInfo(){ 
+        if($this->info == null){
+            echo "Loading dsInfo cache\n";
+            $this->info = new DsInfo();
+            $this->info->load($this->getFileContents("/ds.json"));
+        }else{
+            echo "Using cached dsInfo\n";
+        }
+        return $this->info;        
+    }
+    public function setInfo($dat){ 
+        $this->info = $dat;
+
+        $tmp = tempnam("/tmp/", 'ds_new.');
+        file_put_contents($tmp, json_encode($dat));
+        $this->putFile($tmp, "/ds.json");
+        logger(LOG_DEBUG,"DS $this->guid setInfo succeeded");
+        unlink($tmp);
+    }
+
+    public function mount() {
+        $res = $this->doCloudCommand("-stat $this->guid/ds.json");
+        
+        if($res->result != "success"){
+            throw new Exception("Failed to mount Cloud storage: $this->guid Err: $res->message" );
+        }else if($res->message == "false"){
+            throw new Exception("No ds.json found in Cloud path: $this->guid/");
+        }
+        $this->isMounted = true;
+    }
+    public function unmount() {
+        $this->isMounted = false;
+    }
+    public function isMounted() {
+        try{
+            $this->mount();
+         }catch(Exception $ex){}
+         return $this->isMounted;
+    }
+    
+
+    public function haveFile($remotePath) {
+        if ($remotePath[0] == '/') { $remotePath = ltrim($remotePath, '/'); }
+        $res = $this->doCloudCommand("-stat $this->guid/$remotePath");        
+        if($res->result != "success"){
+            throw new Exception("Failed to stat on Cloud storage: $remotePath Err: $res->message" );
+        }else if($res->message == "false"){
+            return false;
+        }
+        return true;
+    }
+    public function getFile($remotePath, $targetPath) {
+        if ($remotePath[0] == '/') { $remotePath = ltrim($remotePath, '/'); }
+        $res = $this->doCloudCommand("-get $this->guid/$remotePath -o $targetPath");
+        if($res->result != "success"){
+            throw new Exception("Failed to stat on Cloud storage: $remotePath Err: $res->message" );
+        }
+    }
+    public function getFileContents($remotePath) {
+        $tmp = tempnam("/tmp/", 'gf_tmp.');
+        $this->getFile($remotePath, $tmp);
+        $out =file_get_contents($tmp);
+        unlink($tmp);
+        return $out;
+    }
+    public function putFile($sourcePath, $remotePath ) {
+        if ($remotePath[0] == '/') { $remotePath = ltrim($remotePath, '/'); }
+        
+        $res = $this->doCloudCommand("-put $this->guid/$remotePath -o $sourcePath");
+        if($res->result != "success"){
+            throw new Exception("Failed to putFile to Cloud storage: $remotePath Err: $res->message" );
+        }
+    }
+    public function deleteFile($remotePath) {
+        if ($remotePath[0] == '/') { $remotePath = ltrim($remotePath, '/'); }        
+        $res = $this->doCloudCommand("-del $this->guid/$remotePath");
+        if($res->result != "success"){
+            throw new Exception("Failed to deleteFile on Cloud storage: $remotePath Err: $res->message" );
+        }
+    }
+
+    public function listBackups() {        
+        $res = $this->doCloudCommand("-l $this->guid");
+        
+        if(empty($res->files)){ return array(); }
+
+        $versions = array_unique(array_filter(array_map(
+            function($path) {
+                return $this->getVersFolders($path);
+            },
+            $res->files
+        )));        
+        return $versions;
+    }
+
+    public function haveBackup($ts) { 
+        return $this->haveFile("/$ts/meta.json");
+    }
+
+    public function getBackupInfo($ts) {         
+        if(!$this->haveBackup($ts)){ 
+            throw new Exception("No valid meta file found for backup $ts/meta.json");
+        }
+        return json_decode($this->getFileContents("$ts/meta.json"));
+    }
+
+    public function listFiles($versionPath) {
+        if ($versionPath[0] == '/') { $versionPath = ltrim($versionPath, '/'); }        
+        $res = $this->doCloudCommand("-l $this->guid/$versionPath");
+        if(empty($res->files)){ return array(); }
+        $out = array();
+        foreach($res->files as $f){
+            array_push($out, basename($f));
+        }
+        return $out;
+    }
+
+    // used in the array_map for listBackups
+    function getVersFolders($path) {
+        $parts = explode('/', $path);
+         if (count($parts) >= 2 && is_numeric($parts[1]) && strlen($parts[1]) == 10) {
+            return $parts[1];
+        }
+        return null;
+    }
+}
+?>

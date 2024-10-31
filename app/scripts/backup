@@ -1,0 +1,738 @@
+#!/usr/bin/php -q
+<?php
+
+include_once(__DIR__."/../libs/main_lib");
+include_once(__DIR__."/../libs/ds_lib");
+include_once(__DIR__."/../libs/hv_lib");
+
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+
+if($argc < 3){ usage(); }
+
+$guid = "";
+$jobId = 0;
+$storageId=0;
+$workDir = "/tmp";
+
+function usage(){
+        echo colorize("Usage:  -g <guid> -j <jobid> ", "yellow"). "\n";
+        exit(1);
+}
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-j"){
+		if($argc > $i){
+			$i++;
+			$jobId = $argv[$i];
+		}	
+	}else if($argv[$i] == "-g"){
+		if($argc > $i){
+			$i++;
+			$guid = $argv[$i];
+		}	
+	}
+}
+if(empty($guid) || $jobId ==0){
+	usage();
+	exit();
+}
+
+
+$ds = null;
+$dsPath = "";
+try{
+	
+	$job = getJob($jobId);
+	
+	if($job->type != BACKUP){
+		throw new Exception("Invalid job ($jobId) of type $job->type provided.  Backup type required.");
+	}
+	
+	Joblog::setup($jobId,$guid);
+
+	foreach($job->targets as $t){		
+		if($guid == $t->guid){			
+			$storageId = $t->storageId;	
+			break;
+		}	
+	}
+	
+	$storageId = 2;
+	$guid = "75B02960-2796-4B7C-85C2-830F5A8B71EA";
+
+
+	if($storageId ==0){
+		Joblog::log(LOG_ERR,"Guid is not a target in this job ($guid)");
+		echo "No guid!\n";
+		exit(1);
+	} 
+		
+	$target = getTarget($guid);	
+		
+	// we need a type on the target!
+	$target->host = getPoolMasters($target->poolid);	
+	
+	
+	if(empty($target->host)){
+		Joblog::log(LOG_ERR,"Unable to find host for target ($guid => $target->poolid)");
+		echo "No host for target!\n";
+		exit(1);
+	}
+	
+
+	Joblog::log(LOG_DEBUG, "Starting backup of system: $guid ($target->name)");
+	$st = getStorage($storageId);
+
+	if(!$st->haveDS($guid)){		
+		Joblog::log(LOG_INFO, "DS not found on storage for: $guid ($target->name)");
+		if(getSetting("autoCreateDs")){
+			Joblog::log(LOG_INFO, "Creating DS for $guid ($target->name) from defaults.");
+			$defBs = getSetting("blocksize");
+			$defRet = getSetting("defaultRetention");
+			$defCbt = getSetting("defaultCbt");
+			$ds = getDS($storageId, $guid);
+			$ds->create($target->name, $defBs, $defRet, $defCbt);
+		}else{
+			echo "Autocreate is disabled.  Please create the DS\n";
+			Joblog::log(LOG_ERR, "Autocreate setting is disabled. Please create a DS for $guid ($target->name) manually.");
+			exit(1);
+		}
+	}else{
+		echo "We have the ds for $guid\n";
+	}
+
+    $ds = getDS($storageId,$guid);
+    try{
+        if(!$ds->isMounted()){
+            Joblog::log(LOG_DEBUG, "DS is not mounted.  mounting now");
+            $ds->mount();
+        }else{
+            Joblog::log(LOG_DEBUG,"DS is already mounted");
+        }
+    }catch(Exception $ex){
+		$msg ="Error mounting DS: ".$ex->getMessage()." JobID $jobId";
+        Joblog::log(LOG_ERR,$msg);
+		sendAlerts($msg);
+        exit(1);
+    }
+	
+
+	$res = doBackup($target, $jobId, $ds);
+
+	// when a backup completes successfully
+	//	get a unique list of prints in all new hcls & compare to the same of the prev. backup. 
+	//	-delete all blocks in current that are orphaned BEFORE taking snapshot
+
+	exit($res);
+}catch(Exception $ex){
+	Joblog::log(LOG_ERR, $ex->getMessage() );
+	echo $ex->getMessage();
+	exit(1);
+}finally{
+    if(is_object($ds) ){
+        $ds->unmount();
+    }
+
+}
+
+
+//	Run a backup of a single system
+//	The DS is already mounted for us, so these are our high-level steps
+//		-Gather meta info for target
+//		-Take snapshot of target
+//		-Mount snapshot disks (xen: nbd, hv: ps, pm: qemu-nbd?)
+//		-generate munger.json & run backup
+//		-copy/send meta.info to DS (cloud requires put)
+//		-insert backup version in DB
+//
+function doBackup($target, $jobId, $ds ){
+	$ret = 0;
+	$snapTime = time();
+	$ts = time();
+	$h = getHost($target->host);
+
+    Joblog::log(LOG_INFO,"Starting backup version $ts of $target->name [JobID $jobId]");
+
+	$loglet = Joblog::getLoglet("Detecting previous backup", LOG_INFO);
+	$prevBase = getPreviousVersPath($jobId, $target, $ds);	
+	$loglet->setProgress(100);
+	
+
+	global $workDir;
+	$workDir = "/tmp/job.$jobId/$target->guid";
+	exec("mkdir -p $workDir");
+
+	$result = "pending";
+	$snap = null;
+	$conf = null;
+	try{		
+		$snap = snapshotVm($target, $h, $ts);
+		$uuid = $target->guid;
+		if($h->type == XEN){ $uuid = $snap->uuid; }	// we use the snap meta for Xen
+		$vmMeta = getVmMeta($uuid, $h, $target);	// get meta from snapshot to gather snap vdi uuids for CBT, etc		
+		$confDisks = prepareDisksForBackup($snap, $h, $prevBase, $ds, $jobId, $vmMeta);	// xen: mount nbd locally
+		$conf = createMungeConfig($target, $confDisks, $jobId, $ts, $ds, $h);	// create munge.json (will need dsPath to pull in hcls)
+		processBackup($conf, $jobId, $target,$h);	// run munger
+		storeMeta($vmMeta, $ts, $ds);		// copy meta to DS 
+		recordBackup($target->guid, $ts, $jobId, $ds);
+		$result = "success";
+	}catch(Exception $ex){		
+		$msg = "We had a failure, and should delete the backup ($ts)\n -->Error: ". $ex->getMessage();
+        Joblog::log(LOG_ERR,"$msg [$target->name, JobID $jobId]");
+		$result = "error";
+		$elapsed = time() - $ts;
+		$msg = "Error with backup ($ts) of $target->name ($elapsed seconds) [JobID $jobId].  Error: ". $ex->getMessage();
+		sendAlerts($msg);
+		return false;
+	}finally{
+		Joblog::log(LOG_DEBUG, "Backup in finally for job $jobId  with result: $result");
+		if($h->type == XEN && $conf != null){
+			Joblog::log(LOG_DEBUG, "Cleaning up job $jobId");
+			cleanupNbds($conf);
+		}else if($h->type == HV){
+			$snapDisks = \HV\getSnapDisks($h->ip, $target->guid, $snap);
+			foreach($snapDisks as $d){
+				$vhd = trim($d);
+				echo "Detaching $vhd...\n";
+				$out = \HV\detachVhd($h->ip, $vhd);
+				print_r($out);
+			}
+		}
+		$dsInfo = $ds->getInfo();
+		if($dsInfo->cbtEnable && $result == "success"){
+			handleCbtCleanup($h, $snap->uuid, $prevBase, $ts, $ds);			
+		}else{		
+			
+			if($h->type == XEN){
+				Joblog::log(LOG_DEBUG, "Deleting snapshot $snap->uuid for job $jobId");
+				deleteSnapshot($snap->uuid, $h);
+			}else if($h->type == HV){
+				Joblog::log(LOG_DEBUG, "Deleting snapshot $snap for job $jobId");
+				\HV\deleteSnapshot($h->ip, $target->guid, $snap);
+			}
+		}
+	}
+    $elapsed = time() - $ts;
+	$msg = "Completed backup version $ts of $target->name  in $elapsed seconds. [JobID $jobId]";
+    Joblog::log(LOG_INFO,$msg);
+
+	sendAlerts($msg);
+	return true;
+}
+
+// Cleans up after a successful cbt backup
+//	1. removes previous cbt vdis
+//	2. data-destroys current vdis (which also deletes the vbds and snapshot)
+//	3. update the DS' ds.json with this backup's ts
+function handleCbtCleanup($h, $snapUuid, $prevBase, $ts, $ds){
+	Joblog::log(LOG_DEBUG, "Managing CBT snapshot ");
+
+	$prevMeta = json_decode($ds->getFileContents("$prevBase/meta.json"));
+	foreach($prevMeta->disks as $d){
+		$cmd = "vdi-delete $d->vdi";		
+		$res = xenCmd($h->ip, $h->username, $h->password, $cmd);
+		Joblog::log(LOG_DEBUG,"Deleted previous snap VDI $d->vdi.  Results: ".print_r($res, true));
+	}
+	$res = xenCmd($h->ip, $h->username, $h->password, "snap-data-destroy $snapUuid");	// shrink the cbt disk to be kind to their storage
+	Joblog::log(LOG_DEBUG,"Data destroyed snapshot.  Results: ". json_encode($res) );
+	$inf = $ds->getInfo();
+	$inf->cbtTs = $ts;
+	$ds->setInfo($inf);		// update the ds.json with our cbtTs for the next job to use	
+	Joblog::log(LOG_DEBUG,"Updated our ds.json with our version $ts");
+}
+
+function snapshotVm($target, $h, $ts){
+	$loglet = Joblog::getLoglet("Taking snapshot of $target->name", LOG_INFO);
+
+	$snapper = "";
+	$snapName = APP_NAME ."_$ts";
+		
+	// We need to determine the platform
+	if($h->type == XEN){
+		$snapper = xenCmd($h->ip, $h->username, $h->password, "vm-snapshot $target->guid $snapName");
+		echo "Snap out: \n";
+		print_r($snapper);
+		if($snapper->result != "success"){
+			throw new Exception("Error taking snapshot: ". $snapper->message);
+		}
+	}else if($h->type == HV){		
+		echo "Doing snap\n";
+		$snapper = \HV\snapshotVm($h->ip, $target->guid , $snapName);	// this returns just the snapshot name
+		if(!empty($snapper)){
+			throw new Exception("ERROR: Failed to take snapshot: $snapper");
+		}
+		echo "done snap\n";
+		$snapper = $snapName;
+	}
+
+	$loglet->setProgress(100);
+
+	Joblog::log(LOG_DEBUG,"Took snapshot of $target->guid: ", json_encode($snapper));
+	return $snapper;
+}
+function deleteSnapshot($snapguid, $h){
+	$loglet = Joblog::getLoglet("Deleting snapshot of system", LOG_INFO);
+	$res = xenCmd($h->ip, $h->username, $h->password, "snap-delete $snapguid");	
+	$loglet->setProgress(100);
+	Joblog::log(LOG_DEBUG, "Deleted snapshot $snapguid with results: ", json_encode($res));
+	return $res;
+}
+
+// 	We will need this to restore the full VM.
+// 	This goes in the backup folder alongside the HCL files
+function getVmMeta($guid, $h, $target){
+	$meta = null;
+	if($h->type == XEN){
+		$meta = xenCmd($h->ip, $h->username, $h->password, "vm-meta $guid");			
+		$meta->name = $target->name;	// we should also replace the "name" as it is currently the name of the snapshot 
+	}else if ($h->type == HV){
+		$meta = \HV\getVmMeta($h->ip, $guid);	
+	}
+	
+	if(empty($meta)){
+		throw new Exception("Failed to get meta info for VM $guid.  Invalid json results returned.");
+	}
+
+	usort($meta->disks, function($a, $b) {
+		return $a->position - $b->position;
+	});
+	Joblog::log(LOG_DEBUG,"Gathered system metadata");
+	return $meta;
+}
+function storeMeta($meta, $ts, $ds){
+	$loglet = Joblog::getLoglet("Storing meta-data from backup", LOG_INFO);
+	// local type need a chown
+	if($ds->type ==0){
+		exec("sudo chown -R 1000:1000 ".$ds->getPath() ."/$ts");
+	}
+	
+	$fp = "/tmp/meta.json.$ts";
+	file_put_contents($fp, json_encode($meta) );
+	$ds->putFile($fp, "/$ts/meta.json");
+	logger(LOG_DEBUG, "Put vmMeta to $ts/meta.json");
+	unlink($fp);
+	$loglet->setProgress(100);
+}
+
+// Note: If $j->cbt is true, then we have already validated the version exists locally
+//
+//	We loop over all vdis, and to the following for each:
+//		1. connect an nbdX to the XS nbd-server for the vdi
+//		2. copy the hca to the /tmp work dir (if it exists)		-- NB. we copy to ensure it is available for all backup paths
+//		3. if cbt is enabled, prepare the xlc for the drive based on the previous vdi bitmap
+function prepareDisksForBackup($snap, $h, $prevBase, $ds, $jobId, $meta){
+	
+	$loglet = Joblog::getLoglet("Preparing disk data for backup", LOG_INFO);
+	if($h->type == XEN){
+		return prepareDisksForBackupXen($snap, $h, $prevBase, $ds, $jobId, $meta, $loglet);
+	}else if($h->type == HV){
+		return prepareDisksForBackupHv($snap, $h, $prevBase, $ds, $jobId, $meta, $loglet);
+	}
+}
+function prepareDisksForBackupHv($snap, $h, $prevBase, $ds, $jobId, $meta, $loglet){
+	$dsInfo = $ds->getInfo();
+	$blockSize = $dsInfo->blocksize;
+	$prevMeta = null;
+	$ip = $h->ip;
+
+	// the cbtTs can be 0 when the cbt baseline isn't set yet.  
+	$checkCbtBmps = false;
+	if($dsInfo->cbtEnable && $dsInfo->cbtTs != 0){
+		$checkCbtBmps=true;
+		$prevMeta = json_decode($ds->getFileContents("$prevBase/meta.json"));
+	}
+	global $workDir;
+	$loglet->setProgress(10);
+	$snapDisks = \HV\getSnapDisks($ip, $meta->guid, $snap);
+	$diskInfo = array();		// will contain the source (eg. nbd), hcl, and xcl (if available)	
+
+	$i=0;
+	foreach($snapDisks as $d){
+		$tmp = new stdClass();
+		$loglet->tick(5);
+		$physNum = trim(\HV\attachVhd($ip, trim($d) ) );	
+		$physDisk= "\\\\.\\PhysicalDrive$physNum";
+		$tmp->source = trim($physDisk);
+
+		if($prevBase !== null){
+			$hcl = "$prevBase/$i.hcl";
+			if($ds->haveFile($hcl)){
+				$jobTmp = "$workDir/$i.hca";
+				$ds->getFile($hcl, $jobTmp);			// we need to pull them in locally in case we're cloud-based
+				$tmp->hcl = $jobTmp;
+				Joblog::log(LOG_DEBUG, "Added hca: $jobTmp");
+			}
+		}
+		$loglet->tick(5);			
+		// push the disk details 
+		array_push($diskInfo, $tmp);
+		$i++;
+	}
+	$loglet->setProgress(100);
+	return $diskInfo;
+}
+
+function prepareDisksForBackupXen($snap, $h, $prevBase, $ds, $jobId, $meta, $loglet){	
+	$dsInfo = $ds->getInfo();
+	$blockSize = $dsInfo->blocksize;
+	$prevMeta = null;
+	// the cbtTs can be 0 when the cbt baseline isn't set yet.  
+	$checkCbtBmps = false;
+	if($dsInfo->cbtEnable && $dsInfo->cbtTs != 0){
+		$checkCbtBmps=true;
+		$prevMeta = json_decode($ds->getFileContents("$prevBase/meta.json"));
+	}
+	global $workDir;
+	$loglet->setProgress(10);
+
+	$disks = $meta->disks;		// the meta now contains everything we need to know about disks
+	$diskInfo = array();		// will contain the source (eg. nbd), hcl, and xcl (if available)
+	$out = array();
+	try{
+		$i=0;
+		foreach($disks as $d){
+			$tmp = new stdClass();
+			// If CBT is enabled, grab the old vdi and create the bitmap
+			// NOTE: Perform this first to avoid a VDI_IN_USE due to the nbd binding to the vdi!
+			if($checkCbtBmps){
+				$loglet->tick(2);
+				Joblog::log(LOG_DEBUG, "Checking for vdis to make xcl");
+				$oldUuid = "";
+				foreach($prevMeta->disks as $pd){
+					if($pd->position ==$i){ $oldUuid = $pd->vdi; }
+				}
+				Joblog::log(LOG_DEBUG, "Old guid: $oldUuid");
+				if(!empty($oldUuid)){
+					try{						
+						$res =xenCmd($h->ip, $h->username, $h->password, "get-cbt-bitmap $d->vdi $oldUuid");
+						$loglet->tick(5);
+						if($res->result != "success"){
+							Joblog::log(LOG_ERR, "Failed to generate bitmap. Err: $res->message");							
+						}else{
+							$tmp->xcl = "$workDir/$i.xcl";
+							$bmp = base64_decode($res->bitmap);
+							generateCbtForVdi($tmp->xcl, $blockSize, $d->size, $bmp);
+							Joblog::log(LOG_DEBUG, "Made xcl: $tmp->xcl");
+						}
+						$loglet->tick(5);
+					}catch(Exception $ex){
+						Joblog::log(LOG_ERR, "Failed to generate CBT bitmap on old $oldUuid and new: $d->vdi. Err: ". $ex->getMessage() );						
+					}
+				}else{
+					Joblog::log(LOG_INFO, "Previous vdi guid ($oldUuid) not found to make xcl.  CBT disabled for disk $i");
+				}
+			}else{
+				Joblog::log(LOG_DEBUG, "Not checking cbtBmp.  CBT not enabled");
+				//print_r($dsInfo);
+			}
+						
+			$nbd = xenCmd($h->ip, $h->username, $h->password, "vdi-nbd $d->vdi");
+			$loglet->tick(5);
+			
+			$free = trim(shell_exec("lsblk | grep nbd | grep 0B | head -n 1 | awk '{print $1}'"));
+			if (!str_starts_with($free, 'nbd')) {
+				throw new Exception("Failed to find available nbd device ($free)");
+			}
+			$cmd = "sudo nbd-client -g $nbd->server $nbd->port -L -N $nbd->export_name /dev/$free -b 4096";
+			Joblog::log(LOG_DEBUG, "Running $cmd");
+			exec($cmd, $out, $code);
+			if($code != 0){  throw new Exception("NBD Client failed with $code:". print_r($out, true) ); }
+			
+			$loglet->tick(5);
+			$tmp->source = "/dev/$free";
+
+			if($prevBase !== null){
+				$hcl = "$prevBase/$i.hcl";
+				if($ds->haveFile($hcl)){
+                    $jobTmp = "$workDir/$i.hca";
+                    $ds->getFile($hcl, $jobTmp);			// we need to pull them in locally in case we're cloud-based
+					$tmp->hcl = $jobTmp;
+                    Joblog::log(LOG_DEBUG, "Added hca: $jobTmp");
+				}
+			}
+			$loglet->tick(5);			
+			// push the disk details 
+			array_push($diskInfo, $tmp);
+			$i++;
+		}		
+	}catch (Exception $ex){
+		// disconnect any connected nbds to free them
+		foreach($diskInfo as $s){
+			$cmd = "sudo nbd-client -L -d $s->source";
+			$res = shell_exec($cmd);
+			Joblog::log(LOG_WARNING, "Disconnected NBD $s: $res");
+		}
+		throw new Exception($ex->getMessage());
+	}
+	$loglet->setProgress(100);
+	return $diskInfo;
+}
+
+// We use this to find the previous HCL(s)
+// This is used for backups to peform differentials
+// 
+// Check for CBT here.
+// If CBT is enabled, and there is a timestamp in the /ds.json which EXISTS in our DS
+// 		then use that as the prevBase
+// If there is a CBT timestamp in the /ds.json but it doesn't exist:
+//		delete the timestamp in /ds.json
+//		disable CBT for this jobs (locally in memory)
+//		pick the most recent version, as usual
+function getPreviousVersPath($job, $target, $ds){
+
+	$dsInfo = $ds->getInfo();
+	if($dsInfo->cbtEnable == true){		
+		
+		
+		if(isset($dsInfo->cbtTs) && $dsInfo->cbtTs > 0){
+			if($ds->haveBackup($dsInfo->cbtTs)){			
+				Joblog::log(LOG_DEBUG, "We found the CBT version in our archive: $dsInfo->cbtTs");
+				return $dsInfo->cbtTs;				// we found the previous cbt backup locally
+			}
+		}
+		
+		Joblog::log(LOG_INFO,"Previous CBT state was not found in our archive.  Resetting CBT to zero in DS.");
+		$dsInfo->cbtTs =0;
+		$ds->setInfo($dsInfo);
+	}
+	
+	// no CBT, so let's just find the most recent for turbo boost
+    $versions = $ds->listBackups();
+    if(!empty($versions)){
+            usort($versions, function($a, $b) { return basename($b) - basename($a); });     // sort the folders by date
+            logger(LOG_DEBUG,"Found previous version for HCA ". $versions[0]);			
+            return $versions[0];
+    }
+	Joblog::log(LOG_DEBUG,"Could not find any previous versions for HCA");
+	return null;
+}
+
+//	Munger requires a json config, so we prepare it here to feed it in
+//	This determines where munger sends its blocks (local fs, http, or cloud)
+//  As well what disks to munge, if there are hca, or cbt files, the blocksize, etc
+//
+function createMungeConfig($target, $disks, $jobId, $ts, $ds, $h){
+
+	global $workDir;
+
+	$loglet = Joblog::getLoglet("Creating backup config for processor", LOG_DEBUG);
+    $dsInfo = $ds->getInfo();
+
+	// Go requires upper case for json variables
+	$conf = new stdClass();
+	$conf->JobID = intval($jobId);
+	$conf->JobType = 0;	// backup
+	$conf->BlockSize = $dsInfo->blocksize;	
+	$conf->Timestamp = $ts;
+	$conf->Concurrency = 4;
+	$conf->Sources = array();
+	$conf->HcaFiles = array();
+	$conf->XclFiles = array();	
+	$conf->AuthCode = "None";			// only needed for http munges (get from settings db)
+	if($h->type == XEN){
+		$conf->WorkDir = $workDir;
+	}else{
+		$conf->WorkDir = "job.$jobId/$target->guid";	// all remote mungers
+	}
+
+    // *****************
+    // This is not quite true.  A non-cloud munge could be servertype 0 or 1 (that just means munger is local or remote)
+    if($ds->type == 0){                      // DS->type 0 is all local types (disk, NFS, CIFS, etc)		
+		if($h->type == XEN){
+	        $conf->ServerType = 0;				// ServerTypes: 0=A10 local, 1=A10 url, 2=Cloud
+			$conf->ServerUrl = $ds->getPath();		// local file path for xen, remote mungers will need http
+		}else{
+			$serverIP = getServerIP();
+			$conf->ServerType = 1;
+			$conf->ServerUrl = "https://$serverIP:8081/data/$ds->storageId/$target->guid";		// Hmm...
+			$conf->AuthCode = getSetting("apiKey");			
+		}
+    }else if($ds->type ==1){                // DS->type 1 is Cloud S3 
+        $conf->ServerType = 2;				// ServerType: 0=A10 local, 1=A10 url, 2=Cloud
+        $conf->Bucket = $ds->bucket;
+        $conf->AccessKey = $ds->key;
+        $conf->SecretKey = $ds->secret;
+        $conf->Region = $ds->region;
+        $conf->ServerUrl = $ds->endpoint;
+    }
+    
+
+	$conf->Guid = $target->guid;
+	foreach($disks as $d){
+		array_push($conf->Sources, $d->source);
+        if(isset($d->hcl)){
+            array_push($conf->HcaFiles, "$conf->WorkDir/". basename($d->hcl) );	// these are copied to the workDir
+        }else{ array_push($conf->HcaFiles, null);}
+		// Now do the same for the CBT files (XCL)
+		if(isset($d->xcl)){
+            array_push($conf->XclFiles, "$conf->WorkDir/". basename($d->xcl));
+        }else{ array_push($conf->XclFiles, null);}
+	}
+
+	$cf = "$workDir/munge.json";     // Put it to a tmp file b/c for now we're just local munging.  remote guys will need this fed to them
+	$res = file_put_contents($cf, json_encode($conf) );
+	if($res === false){
+		$err = error_get_last();
+		throw new Exception("Failed to write $cf, ". $err["message"] );
+	}
+	$loglet->setProgress(100);
+	return $cf;
+}
+
+function processBackup($confPath, $jobId, $target, $h){
+	
+	if($h->type == XEN){
+		return processBackupLocal($confPath, $jobId, $target);
+	}else{
+		return processBackupRemote($confPath, $jobId, $target, $h);
+	}
+    
+}
+function processBackupRemote($confPath, $jobId, $target, $h){
+	global $workDir;
+	$ip = $h->ip;
+
+	//upload all files from workDir to job.$jobid
+	$files = scandir($workDir);
+	$remoteBase = "job.$jobId/$target->guid";
+	foreach ($files as $file) {
+		if ($file !== '.' && $file !== '..') {
+			echo "Uploading $file to $remoteBase/$file\n";
+			$out = agentUpload($ip, "$workDir/$file", "$remoteBase/$file" );
+			print_r($out);
+		}
+	}
+	$rc = "$remoteBase/". basename($confPath);
+
+	$sf = "$remoteBase/stats.json";
+	$loglet = Joblog::getLoglet("Performing backup of $target->name", LOG_INFO);
+    
+    try{
+        Joblog::log(LOG_DEBUG, "Running munger");
+		$res = agentCmd($ip, "munger.exe", array("-c", "$rc"), true);
+		Joblog::log(LOG_DEBUG, "Remote Munger output:", print_r($out, true));
+		$output = json_decode($res);
+		if (json_last_error() !== JSON_ERROR_NONE) {
+			throw new Exception("Failed to run remote process: $res");
+		}
+
+		while(true){
+			$out = json_decode(agentPidCheck($ip, $output->pid));
+			if($out->running == true){
+				sleep(1);
+				try{
+					$stats = json_decode(agentGetFileContents($ip,$sf));
+					if (json_last_error() === JSON_ERROR_NONE) {
+						$loglet->setProgress($stats->Progress);
+					}
+				}catch(Exception $ex){
+					echo "Failed to get $sf.  Ex:". $ex->getMessage() ."\n";
+				}
+
+			}else{
+				echo "Munger is no longer running! ($output->pid)\n";
+				Joblog::log(LOG_DEBUG, "Remote munger (PID:$output->pid) is no longer running.");
+				break;
+			}
+		}
+		
+    }finally{		
+		Joblog::log(LOG_DEBUG, "processBackupRemote finally.");
+    }
+}
+
+function processBackupLocal($confPath, $jobId, $target){
+	global $workDir;
+
+	$sf = "$workDir/stats.json";
+	$loglet = Joblog::getLoglet("Performing backup of $target->name", LOG_INFO);
+    $kidPid = getProgress($sf, $loglet);     
+    try{
+        Joblog::log(LOG_DEBUG, "Running munger");
+        exec("sudo ".__DIR__."/../bin/munger -c $confPath", $out, $code); 
+	if($code !=0){
+		Joblog::log(LOG_ERR, "MUNGER RETURNED NON-ZERO: $code ". print_r($out, true));
+		throw new Exception("Backup acquisition failed: ". print_r($out, true));
+	}else{
+		Joblog::log(LOG_DEBUG, "Munger output:", print_r($out, true));
+		$loglet->setProgress(100);
+	}
+    }finally{
+         posix_kill($kidPid, SIGKILL);	// end our progress thread rightly
+    }
+}
+
+function cleanupNbds($confPath ){
+	$loglet = Joblog::getLoglet("Cleaning nbds from job", LOG_DEBUG);
+	$conf = json_decode(file_get_contents($confPath));
+	//echo "*** NOT Removing conf file: $confPath\n\n";
+	unlink($confPath);
+
+	// We need to disconnect all of our NBDs from the backup
+	foreach($conf->Sources as $s){		
+		if(str_contains($s, "nbd")){  
+			Joblog::log(LOG_DEBUG, "Disconnecting: $s");
+			exec("sudo nbd-client -L -d $s");
+		}
+	}
+	$loglet->setProgress(100);
+}
+
+######################################################################################################################
+function generateCbtForVdi($outXclFile, $bs, $size, $bmp) {
+    $bs *= 1024 * 1024; // Convert MB to bytes
+    
+    $kblocksPerBMP = $bs / 512;
+    //$totalBlocks = $size / $bs;
+	$totalBlocks = ceil($size / $bs);
+    
+    Joblog::log(LOG_DEBUG, "Generating CBT for disk.  Blocksize: $bs bytes, Total blocks: $totalBlocks, KBperBlock: $kblocksPerBMP");
+
+    if (strlen($bmp) < $totalBlocks) {
+        Joblog::log(LOG_WARNING, "VDI CBT bitmap (from Xen) is too small - $totalBlocks blocks needed vs " . strlen($bmp) . " bytes provided");
+        return;
+    }
+
+    $can = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\n";
+    $cannot = "00000000000000000000000000000000\n";
+
+    if (file_exists($outXclFile)) {
+        unlink($outXclFile);
+    }
+    
+    $fileHandle = fopen($outXclFile, 'w');
+    if ($fileHandle === false) {
+        Joblog::log(LOG_WARNING, "Unable to open file: $outXclFile");
+        return;
+    }
+
+    for ($i = 0; $i < $totalBlocks; $i++) {
+        $blockChanged = false;
+        for ($j = 0; $j < $kblocksPerBMP; $j++) {
+            $byteIndex = $i * $kblocksPerBMP + $j;
+            if ($byteIndex < strlen($bmp) && ord($bmp[$byteIndex]) != 0) {
+                $blockChanged = true;
+                break;
+            }
+        }
+        
+        if ($blockChanged) {
+            fwrite($fileHandle, $cannot);
+        } else {
+            fwrite($fileHandle, $can);
+        }
+    }
+
+	fwrite($fileHandle, "CODA\n");
+    fclose($fileHandle);
+	//file_put_contents($outXclFile,"\nCODA", FILE_APPEND);
+	
+    Joblog::log(LOG_DEBUG, "CBT file generated: $outXclFile");
+}
+
+
+?>

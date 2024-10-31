@@ -1,0 +1,623 @@
+import XenAPI
+import json
+import time
+import sys
+import requests
+import os
+
+def get_hosts(session):
+    try:
+        host_records = session.xenapi.host.get_all_records()
+        host_details = []
+
+        for host_ref, host_record in host_records.items():
+            host_name = host_record['name_label']
+            host_uuid = host_record['uuid']
+            host_ip = host_record['address']
+            host_details.append({
+                "name": host_name,
+                "uuid": host_uuid,
+                "ip": host_ip
+            })
+        return {
+            "result": "success",
+            "hosts": host_details
+        }
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Failed to get host details: "+ str(e)
+        }
+
+
+def create_vm_from_meta(session, meta_file_path):    
+    if not os.path.exists(meta_file_path):
+        return {
+                "result": "error",
+                "message": "Failed to find meta.json file: "+ meta_file_path
+            }        
+    try:
+        with open(meta_file_path, 'r') as file:
+            vm_data = json.load(file)
+    except json.JSONDecodeError as e:
+        return {
+                "result": "error",
+                "message": "Invalid JSON meta file provided: "+ str(e)
+            }
+
+    
+    current_timestamp = int(time.time())
+    vm_name = f"{vm_data['name']}-Restored_{current_timestamp}"
+    try:
+
+
+        # Create a new VM (blank)
+        template_ref = session.xenapi.VM.get_by_name_label("Other install media")[0]
+        vm_ref = session.xenapi.VM.clone(template_ref, vm_name)        
+        vm_uuid = session.xenapi.VM.get_uuid(vm_ref)
+        # Set VM properties
+        session.xenapi.VM.set_memory_static_max(vm_ref, str(vm_data["memory"]))
+        session.xenapi.VM.set_memory_dynamic_max(vm_ref, str(vm_data["memory"]))
+        session.xenapi.VM.set_memory_dynamic_min(vm_ref, str(min(int(vm_data["memory"]), 1024 * 1024 * 1024)))
+        session.xenapi.VM.set_memory_static_min(vm_ref, str(min(int(vm_data["memory"]), 1024 * 1024 * 1024)))
+        session.xenapi.VM.set_VCPUs_max(vm_ref, str(vm_data["cpus"]))
+        session.xenapi.VM.set_VCPUs_at_startup(vm_ref, str(vm_data["cpus"]))
+        session.xenapi.VM.set_HVM_boot_policy(vm_ref, "BIOS order" if vm_data["mbr_or_uefi"] == "bios" else "UEFI")
+
+        ###################### these values STRONGLY influence bootabiliity
+        session.xenapi.VM.set_platform(vm_ref, vm_data["platform"])
+
+        # Get the first non-host internal management network
+        networks = session.xenapi.network.get_all()
+        default_network = None
+        for network in networks:
+            network_name = session.xenapi.network.get_name_label(network)
+            #if network_name == "VM Network" or "VM" in session.xenapi.network.get_tags(network):
+            if "Host internal" not in network_name:
+                default_network = network
+                break
+#        if default_network is None:
+#            print("Warning: No suitable network found. NICs will be created without a network.")
+        
+        # Add NICs
+        for nic in vm_data["nics"]:
+            vif_record = {
+                "device": nic["device"],
+                "network": default_network if default_network else "OpaqueRef:NULL",
+                "VM": vm_ref,
+                "MAC": nic["MAC"],
+                "MTU": "1500",
+                "other_config": {},
+                "qos_algorithm_type": "",
+                "qos_algorithm_params": {},
+                "locking_mode": "network_default",
+                "ipv4_allowed": [],
+                "ipv6_allowed": []
+            }
+            session.xenapi.VIF.create(vif_record)
+        return get_vm_meta(session, vm_uuid)
+
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Failed to create new VM from meta. Error: "+ str(e)
+        }
+def attach_vdi(session, vdi_uuid, vm_uuid):
+    try:        
+        vdi_ref = session.xenapi.VDI.get_by_uuid(vdi_uuid)
+        vm_ref = session.xenapi.VM.get_by_uuid(vm_uuid)
+
+        # Make a VBD pointing to our VDI
+        vbd_record = {
+            "VM": vm_ref,
+            "VDI": vdi_ref,
+            "userdevice": "autodetect",
+            "bootable": False,
+            "mode": "RW",
+            "type": "Disk",
+            "unpluggable": True,
+            "empty": False,
+            "other_config": {},
+            "qos_algorithm_type": "",
+            "qos_algorithm_params": {}
+        }
+        vbd_ref = session.xenapi.VBD.create(vbd_record)
+        vbd_uuid = session.xenapi.VBD.get_uuid(vbd_ref)
+        return{
+            "result": "success",
+            "message": vbd_uuid
+        }
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Failed to attach VDI. Error: "+ str(e)
+        }
+
+def get_vm_meta(session, vm_uuid):
+    try:
+        vm = session.xenapi.VM.get_by_uuid(vm_uuid)
+        record = session.xenapi.VM.get_record(vm)
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Could not find VM with uuid: "+ vm_uuid
+        }
+    if record["is_control_domain"]:
+        return {
+            "result": "error",
+            "message": "VM uuid: "+ vm_uuid +" is DOM0!"
+        }
+    pool = session.xenapi.pool.get_all()[0]
+    pool_record = session.xenapi.pool.get_record(pool)
+    pool_id = pool_record['uuid']
+    vm_details = {
+        "name": record["name_label"],
+        "guid": record["uuid"],
+        "pool": pool_id,
+        "cpus": record["VCPUs_max"],
+        "memory": record["memory_static_max"],
+        "disks": [],
+        "nics": [],
+        "platform": record["platform"],
+        "mbr_or_uefi": record["HVM_boot_params"].get("firmware", "bios"),
+        "secureboot": record["platform"].get("secureboot", "false")
+    }
+    vbds = record["VBDs"]
+    for vbd in vbds:
+        vbd_record = session.xenapi.VBD.get_record(vbd)
+        if vbd_record["type"] == "Disk":
+            vdi = vbd_record["VDI"]
+            
+            vdi_record = session.xenapi.VDI.get_record(vdi)
+            vm_details["disks"].append({
+                "name": vdi_record["name_label"],
+                "size": vdi_record["virtual_size"],
+                "vbd": vbd_record["uuid"],
+                "vdi": vdi_record["uuid"],
+                "position": vbd_record["userdevice"],
+                "cbt-enabled": session.xenapi.VDI.get_cbt_enabled(vdi),
+                "sr": session.xenapi.SR.get_uuid(vdi_record['SR'])
+            })
+    vifs = record["VIFs"]
+    for vif in vifs:
+        vif_record = session.xenapi.VIF.get_record(vif)
+        vm_details["nics"].append({
+            "device": vif_record["device"],
+            "network": vif_record["network"],
+            "MAC": vif_record["MAC"]
+        })
+    return vm_details
+#    print(json.dumps(vm_details, indent=4))
+
+
+def get_poolid(session):
+    pool_ref = session.xenapi.pool.get_all()[0]
+    pool_record = session.xenapi.pool.get_record(pool_ref)
+    return { "poolid": pool_record["uuid"] }
+
+
+# private use by vm_list_details only
+def get_vm_properties(session, vm_ref):    
+    vm_record = session.xenapi.VM.get_record(vm_ref)
+    vm_uuid = vm_record["uuid"]
+    vm_name = vm_record["name_label"]
+    
+    vm_ip = ""
+    vm_record = session.xenapi.VM.get_record(vm_ref)
+
+    vcpus = vm_record["VCPUs_at_startup"]
+    memory = vm_record["memory_static_max"]
+    vbds = session.xenapi.VM.get_VBDs(vm_ref)
+    disks = []
+    for vbd in vbds:
+        vbd_record = session.xenapi.VBD.get_record(vbd)
+        if vbd_record["type"] == "Disk":
+            vdi_ref = vbd_record["VDI"]
+            vdi_record = session.xenapi.VDI.get_record(vdi_ref)
+            disk_size = int(vdi_record["virtual_size"])
+            disk_name = vdi_record["name_label"]
+            disk_position = vbd_record["userdevice"]
+            disks.append({"position": disk_position, "size": disk_size, "name": disk_name})
+    total_disk_size = sum(disk["size"] for disk in disks)
+    return {
+        "guid": vm_uuid,
+        "name": vm_name,   
+        "type": 2,     
+        "ip": vm_ip,
+        "cpus": vcpus,
+        "memory": memory,
+        "totalSize": total_disk_size,
+        "disks": disks
+    }
+
+def vm_list_details(session):
+    
+    pool_ref = session.xenapi.pool.get_all()[0]
+    pool_record = session.xenapi.pool.get_record(pool_ref)
+    pool_uuid = pool_record["uuid"]
+
+    vms = session.xenapi.VM.get_all()
+    vm_properties = []
+    for vm in vms:
+        if not session.xenapi.VM.get_is_a_template(vm) and not session.xenapi.VM.get_is_control_domain(vm):
+            vm_props = get_vm_properties(session, vm)
+            vm_props["poolid"] = pool_uuid
+            vm_properties.append(vm_props)
+    return vm_properties
+
+# a basic list of all vms and uuids
+def vm_list(session):
+    try:
+        vms = session.xenapi.VM.get_all()
+        vm_uuids = {}
+        for vm in vms:
+            vm_record = session.xenapi.VM.get_record(vm)
+            if not vm_record["is_a_template"] and not vm_record["is_control_domain"]:
+                vm_name = vm_record["name_label"]
+                vm_uuid = vm_record["uuid"]
+                vm_uuids[vm_name] = vm_uuid
+        return vm_uuids
+    except XenAPI.Failure as e:
+        return {
+                "result": "error",
+                "message": "Failed to list disks of vm. Error: "+ str(e)
+            }
+
+def vm_disk_list(session, vm_uuid ):
+    try:
+        all_disks= []
+        vm = session.xenapi.VM.get_by_uuid(vm_uuid)
+        vbds = session.xenapi.VM.get_VBDs(vm)
+        for vbd in vbds:
+            vbd_record = session.xenapi.VBD.get_record(vbd)
+            if vbd_record['type'] != 'Disk':
+                continue
+            vdi = vbd_record['VDI']
+            if vdi != 'OpaqueRef:NULL':
+                vdi_record = session.xenapi.VDI.get_record(vdi)
+            disk = {
+                "name": vdi_record['name_label'],
+                "vdi_uuid": vdi_record['uuid'],
+                "vbd_uuid": vbd_record['uuid'],
+                "size": vdi_record['virtual_size'],
+                "position": vbd_record["userdevice"],
+                "cbt-enabled": session.xenapi.VDI.get_cbt_enabled(vdi),
+                "sr": session.xenapi.SR.get_uuid(vdi_record['SR'])
+            }
+            all_disks.append(disk)
+        return all_disks
+    except XenAPI.Failure as e:
+        return {
+                "result": "error",
+                "message": "Failed to list disks of vm. Error: "+ str(e)
+            }
+
+def snapshot_vm(session, vm_uuid, snapshot_name=None):
+    try:
+        vm = session.xenapi.VM.get_by_uuid(vm_uuid)
+        if snapshot_name is None or snapshot_name == "":
+            timestamp = time.strftime("%Y%m%d-%H%M%S")
+            snapshot_name = f"Snapshot-{timestamp}"
+        
+        snapshot_ref = session.xenapi.VM.snapshot(vm, snapshot_name)
+        snapshot_uuid = session.xenapi.VM.get_uuid(snapshot_ref)
+        
+        snap = {
+            "result": "success",
+            "name": snapshot_name,
+            "uuid": snapshot_uuid
+        } 
+        return snap
+    except XenAPI.Failure as e:
+        return {
+                "result": "error",
+                "message": "Failed to snapshot VM. Error: "+ str(e)
+            }
+
+def snapshot_delete(session, snap_uuid):
+    def destroy_with_retry(destroy_func, ref, ref_type):
+        max_retries=5
+        retry_interval=5
+        for attempt in range(max_retries):
+            try:
+                destroy_func(ref)
+                return True
+            except XenAPI.Failure as e:
+                if e.details[0] == "VDI_IN_USE" and attempt < max_retries - 1:                    
+                    time.sleep(retry_interval)
+                elif e.details[0] == "UUID_INVALID":
+                    return True
+                else:
+                    raise
+    try:
+        snapshot = session.xenapi.VM.get_by_uuid(snap_uuid)
+        vbds = session.xenapi.VM.get_VBDs(snapshot)
+        vdis = []
+        for vbd in vbds:
+            vdi = session.xenapi.VBD.get_VDI(vbd)
+            if vdi != "OpaqueRef:NULL":
+                vdis.append(vdi)
+        for vbd in vbds:
+            session.xenapi.VBD.destroy(vbd)
+        for vdi in vdis:
+            destroy_with_retry(session.xenapi.VDI.destroy, vdi, "VDI")
+
+        session.xenapi.VM.destroy(snapshot)
+
+        return {
+            "result": "success",
+            "message": snap_uuid +" and all of its associated data have been deleted successfully"
+        }        
+    
+    except XenAPI.Failure as e:
+        return {
+                "result": "error",
+                "message": "Failed to delete snapshot "+snap_uuid+". Error: "+ str(e)
+            }
+
+def enable_cbt_vdi(session, vdi):
+    vdi_uuid = session.xenapi.VDI.get_uuid(vdi)    
+    if not session.xenapi.VDI.get_cbt_enabled(vdi):
+        print(f"Enabling CBT for VDI: {vdi_uuid}")
+        session.xenapi.VDI.enable_cbt(vdi)
+        # Wait for CBT to be fully enabled
+        start_time = time.time()
+        while not session.xenapi.VDI.get_cbt_enabled(vdi):
+            if time.time() - start_time > 10:                    
+                raise Exception(f"Failed to enable CBT on vdi (timeout): {vdi_uuid}")
+            time.sleep(1)
+
+def vm_enable_cbt(session, vm_uuid):
+    try:
+        vm = session.xenapi.VM.get_by_uuid(vm_uuid)
+
+        vbds = session.xenapi.VM.get_VBDs(vm)        
+        vdis = [session.xenapi.VBD.get_VDI(vbd) for vbd in vbds]
+        
+        for vdi in vdis:
+            enable_cbt_vdi(session, vdi)
+        return {
+            "result": "success",
+            "message": vm_uuid +": all disks have cbt enabled"
+        }         
+    except XenAPI.Failure as e:        
+            return {
+                "result": "error",
+                "message": "Failed to enable cbt on vdi. Error: "+ str(e)
+            }            
+
+#   Hollow out all vdis on a snapshot, then delete the vbds and snapshot but leave (loose) data-destroyed vdis
+#   If there are any errors, the snapshot is completely deleted (vdis and all)
+#
+#   The caller is responsible for cleaning up the vdis after a sucessful call, as they are on longer associated w/ a snapshot
+#   This is a requirement of Xen as you cannot have a VBD connected to a VDI when performing data-destroy
+def data_destroy_snapshot(session, snap_uuid):
+    try:
+        snapshot = session.xenapi.VM.get_by_uuid(snap_uuid)
+
+        vbds = session.xenapi.VM.get_VBDs(snapshot)        
+        vdis = [session.xenapi.VBD.get_VDI(vbd) for vbd in vbds]       
+
+        for vbd in vbds:
+            session.xenapi.VBD.destroy(vbd)        # delete vbds first 
+        session.xenapi.VM.destroy(snapshot)        # now remove the snapshot
+                
+        try:
+            for vdi in vdis:
+                session.xenapi.VDI.data_destroy(vdi)
+        except XenAPI.Failure as e:
+            #print(f"Failed to data_destroy VDI (CBT). Error: {str(e)}")
+            for vdi in vdis:
+                session.xenapi.VDI.destroy(vdi)     # on failure, remove ALL vdis to avoid orphans
+            return {
+                "result": "error",
+                "message": "Failed to data_destroy VDI (CBT). Error: "+ str(e)
+            }
+            
+        
+        return {
+            "result": "success",
+            "message": "Snapshot has been data-destroyed."
+        }
+    
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Failed to data_destroy VDI (CBT). Error: "+ str(e)
+        }
+        
+def vdi_create(session, size, sr_uuid, name, desc='Created by unnamed Backup Tool'):
+    try:
+        # Get the Storage Repository object
+        sr = session.xenapi.SR.get_by_uuid(sr_uuid)
+        
+        # Create the VDI
+        vdi = session.xenapi.VDI.create({
+            'name_label': name,
+            'name_description': desc,
+            'SR': sr,
+            'virtual_size': size,
+            'type': 'user',
+            'sharable': False,
+            'read_only': False,
+            'other_config': {}
+        })
+        
+        # Get the UUID of the newly created VDI
+        vdi_uuid = session.xenapi.VDI.get_uuid(vdi)
+        
+        return {
+            "result": "success",
+            "message": vdi_uuid
+        }
+    
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Failed to create VDI. Error: "+ str(e)
+        }
+
+def vdi_delete(session, vdi_uuid):
+    try:
+        vdi = session.xenapi.VDI.get_by_uuid(vdi_uuid)         
+        session.xenapi.VDI.destroy(vdi)
+        return {
+            "result": "success",
+            "message": "VDI "+vdi_uuid+" destroyed successfully"
+        }
+        
+    except XenAPI.Failure as e:
+        if e.details[0] == "UUID_INVALID":
+            return {
+                "result": "success",
+                "message": "VDI was already deleted"
+            }
+        else:
+            return {
+                "result": "error",
+                "message": "Failed to destroy "+vdi_uuid+". Error: "+  str(e)
+            }
+
+def get_cbt_bitmap(session, current_vdi_uuid, previous_vdi_uuid):
+    try:
+        current_vdi = session.xenapi.VDI.get_by_uuid(current_vdi_uuid)
+        previous_vdi = session.xenapi.VDI.get_by_uuid(previous_vdi_uuid)
+        bitmap = session.xenapi.VDI.list_changed_blocks(previous_vdi, current_vdi)  # this is all we really use currently
+        
+        #encoded_bitmap = bitmap['changed_blocks']        
+        #btmp = base64.b64decode(encoded_bitmap)
+        #bool_bitmap = [bool(btmp[i // 8] & (1 << (i % 8))) for i in range(len(btmp) * 8)]
+
+        return {
+            "result": "success",
+            'bitmap': bitmap
+            #'num_changed_blocks': sum(bool_bitmap)            
+        }
+    except XenAPI.Failure as e:
+        return {
+            "result": "error",
+            "message": "Xen Error generating bitmap for cbt: "+  str(e)
+        }
+        
+    except Exception as e:
+        return {
+            "result": "error",
+            "message": "Error generating bitmap for cbt: "+  str(e)
+        }
+
+def get_nbd(session, vdi_uuid):
+    try:
+        vdi = session.xenapi.VDI.get_by_uuid(vdi_uuid)
+        nbd_info = session.xenapi.VDI.get_nbd_info(vdi)
+	# Extract the necessary information from nbd_info	** there can be multiple nbds (diff hosts) in the nbd_info array
+        #print(nbd_info)
+        nbd_config = nbd_info[-1]			
+        nbd_port = int(nbd_config["port"])
+        nbd_server_address = nbd_config["address"]
+        export_name = nbd_config["exportname"]
+        info = {
+            "server": nbd_server_address,
+            "port": nbd_port,
+            "export_name": export_name
+        }
+        return info
+    except XenAPI.Failure as e:
+        return e.details
+        #print(json.dumps(info, indent=4))
+
+def get_session(host,user,password):
+    session = XenAPI.Session("https://{host}")
+    try:
+        session.xenapi.login_with_password(user, password)
+    except XenAPI.Failure as e:
+        print("Failed to acquire a session: %s" % e.details)
+        sys.exit(1)
+    return session
+
+def main():
+    if len(sys.argv) < 5:
+        print("Usage: <host> <user> <pass> <call> <param>")
+        print("Calls: vm-list, vm-disk-list, vm-meta, vm-snapshot, snap-disk-list, snap-delete, vdi-nbd, get-poolid create-vm")
+        sys.exit(1)
+
+    host = sys.argv[1]
+    user = sys.argv[2]
+    passwd = sys.argv[3]
+    call = sys.argv[4]
+    param = ""
+    if len(sys.argv) > 5:
+        param = sys.argv[5]
+    param2 = ""
+    if len(sys.argv) > 6:
+        param2 = sys.argv[6]
+    param3 = ""
+    if len(sys.argv) > 7:
+        param3 = sys.argv[7]
+    param4 = ""
+    if len(sys.argv) > 8:
+        param4 = sys.argv[8]
+
+    session = XenAPI.Session("http://"+ host)
+    try:
+        session.login_with_password(user, passwd)
+    except XenAPI.Failure as e:
+        err = e.details[0]
+        if err == "HOST_IS_SLAVE":
+            slave = e.details[1]
+            session = XenAPI.Session("http://"+ slave )	
+            session.login_with_password(user, passwd)
+
+    res = {
+        "result": "error",
+	"message": "Unknown"
+    }
+    try:
+        if call == "vm-meta":
+            res = get_vm_meta(session,param)
+        elif call == "vdi-nbd":
+            res = get_nbd(session, param)
+        elif call == "vm-snapshot":
+            res = snapshot_vm(session, param, param2)
+        elif call == "vm-disk-list":
+            res = vm_disk_list(session, param)
+        elif call == "snap-disk-list":
+            res = vm_disk_list(session, param)
+        elif call == "snap-delete":
+            res = snapshot_delete(session, param)
+        elif call == "vm-list":
+            res = vm_list(session)
+        elif call == "vm-list-details":
+            res = vm_list_details(session)
+        elif call == "get-poolid":
+            res = get_poolid(session)
+        elif call == "get-cbt-bitmap":
+            res = get_cbt_bitmap(session, param, param2)
+        elif call == "vm-cbt-enable":
+            res = vm_enable_cbt(session,param)
+        elif call == "snap-data-destroy":
+            res = data_destroy_snapshot(session, param)
+        elif call == "vdi-delete":
+            res = vdi_delete(session, param)
+        elif call == "vdi-create":
+            res = vdi_create(session, param, param2, param3, param4)        
+        elif call == "create-vm":
+            res = create_vm_from_meta(session, param)
+        elif call == "attach-vdi":
+            res = attach_vdi(session, param, param2)
+        elif call == "get-hosts":
+            res = get_hosts(session)
+        else:
+            res = "Unknown call: "+call
+    except Exception as e:
+        res = {
+            "result": "error",
+            "message": "Error: " + str(e)
+        }
+
+    print(json.dumps(res, indent=4))
+
+    if call != "vdi-nbd" :
+        session.logout()
+
+if __name__ == "__main__":
+    main()

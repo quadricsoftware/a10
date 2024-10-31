@@ -1,0 +1,174 @@
+#!/usr/bin/php -q
+<?php
+
+include_once(__DIR__."/../libs/main_lib");
+include_once(__DIR__."/../libs/ds_lib");
+
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+
+if($argc < 2){ usage(); }
+
+$guid = "";
+$storageId= 0;
+$version=0;
+
+function usage(){
+        echo "Usage: -s <storageId> -g <guid>\n";
+	echo "If no guid is provided, then all DSs on target storage will be processed\n";
+	echo "If a guid is provided, then only that DS will be processed\n";
+	echo "Note: Only basic retention will be processed.  If a DS has the 'retention' set to 0, it will be skipped\n";
+	echo "\n";
+	exit(1);
+}
+
+if($argc == 4){
+	echo colorize("Did you mean to provide a DS guide (-g)?\n\n", "yellow");
+	usage();
+}
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-s"){
+		if($argc > $i){
+			$i++;
+			$storageId= $argv[$i];
+		}	
+	}else if($argv[$i] == "-g"){
+		if($argc > $i){
+			$i++;
+			$guid = $argv[$i];
+		}	
+	}
+}
+if( $storageId==0 ){
+	usage();
+	exit();
+}
+/* 
+if(!file_exists($jobJson)){
+	logger(LOG_ERR,"Job config file ($jobJson) not found");
+	exit(1);
+}
+$j = json_decode(file_get_contents($jobJson));
+if ($j === null && json_last_error() !== JSON_ERROR_NONE) {
+	logger(LOG_ERR,"Failed to parse job config file ($jobJson)");
+	echo "Failed to parse job config: $jobJson\n";
+	exit(1);
+} */
+
+
+$j = new stdClass();
+$ds = null;
+
+try{
+	
+	$j->id = rand(1,1000);
+	Joblog::setup($j->id, $storageId);
+
+	$st = getStorage($storageId);	// throws if it doesn't exist
+	$topLog = Joblog::getLoglet("Beginning standard retention job for Storage $st->name", LOG_INFO);
+	$st->mount();
+	$dss = $st->listDS();
+	$topLog->tick();
+
+	$needed = array();
+
+	foreach($dss as $guid){
+		$topLog->tick();
+		$ds = getDS($storageId, $guid);
+		try{
+			echo "Checking DS: $ds->guid \n";
+			$lg = Joblog::getLoglet("Inspecting DS $ds->guid", LOG_INFO);
+			$ds->mount();
+			$info = $ds->getInfo();
+			$lg->setText("Inspecting DS $ds->guid [$info->name].  Retention: $info->retention");
+			if($info->retention <= 0){
+				echo "DS $info->name [$guid] has Standard retention disabled for DS ($info->retention)\n";
+				$lg->setText("Inspecting DS $ds->guid [$info->name].  Standard Retention disabled.");
+				continue;
+			}
+			$lg->tick(10);
+			$backups = $ds->listBackups();
+			$num = count($backups);
+			echo "$num backups found\n";
+			$lg->setText("Inspecting DS $ds->guid [$info->name]. Retain: $info->retention, Found: $num");
+			if(!isset($info->retention)){
+				$info->retention =0;
+				$res = $ds->setInfo($info);
+				$msg = "Found DS with missing retention setting ($ds->guid: $info->name). Added IGNORE PURGE option.";
+				Joblog::log(LOG_WARNING, $msg);
+				logger(LOG_WARNING,$msg);
+			}
+			if($num > $info->retention){
+				$kill = $num  -$info->retention ;
+				Joblog::log(LOG_INFO, "Found $kill backups to purge on DS $ds->guid ($info->name).");
+				array_push($needed, $guid);
+			}
+			$lg->setProgress(100);
+		}finally{
+			$ds->unmount();
+		}
+	}
+
+	if(empty($needed)){
+		$msg = "No backups currently require purging";
+		Joblog::log(LOG_INFO, $msg);
+		logger(LOG_INFO, $msg);
+	}else{
+		Joblog::log(LOG_INFO, "Beginning purge for backups");
+		foreach($needed as $guid){
+			enforceRetention($storageId, $guid);
+		}
+	}
+
+	$msg = "Standard retention processing complete for: $st->name ($st->id)";
+	Joblog::log(LOG_INFO, $msg);
+	$topLog->setProgress(100);
+	$st->unmount();
+	sendAlerts($msg);
+}catch(Exception $ex){
+	logger(LOG_ERR, $ex->getMessage() );
+	$msg = "Error during standard retention job:". $ex->getMessage();
+	Joblog::log(LOG_ERR,$msg);
+	sendAlerts($msg);
+	exit(1);
+}finally{
+    if(is_object($ds) ){
+        $ds->unmount();
+    }
+}
+
+function enforceRetention($storageId, $guid){
+	$ds = getDS($storageId, $guid);
+	$info = $ds->getInfo();
+	$keep = $info->retention;
+	$backups = $ds->listBackups();
+	usort($backups, function($a, $b) { return $b - $a; });	// sort them so the newest is first
+	echo "Backups on $guid:\n";
+	$tbd = array();
+	foreach($backups as $b){
+		$act = $keep;
+		if($keep <= 0){ 
+			$act = "KILL ME!"; 
+			array_push($tbd, $b);
+		}
+		echo "$b $act\n";
+		$keep--;
+	}
+	echo count($tbd) ." backups to purge...\n";
+	echo "Now to purge...\n";
+	foreach($tbd as $purge){
+		$lg = Joblog::getLoglet("Purging backup $purge ($info->name)", LOG_INFO);
+		$num = $ds->purge($purge);
+		dbSet("main", "DELETE from backups where timestamp=? and guid=? and storageId=?", array($purge, $guid, $storageId));
+		$approx = $info->blocksize * $num;
+		$lg->setProgress(100);
+		$lg->setText("Purging backup $purge ($info->name) $num blocks deleted [~$approx MB]", LOG_INFO);
+	}
+}
+
+
+?>

@@ -1,0 +1,275 @@
+#!/usr/bin/php -q
+<?php
+
+include_once(__DIR__."/../libs/main_lib");
+include_once(__DIR__."/../libs/ds_lib");
+
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+
+if($argc < 2){ usage(); }
+
+$guid = "";
+$storageIdSrc = 0;
+$storageIdDest = 0;
+$version=0;
+
+function usage(){
+        echo "Usage: -g <guid> -s <source storageId> -b <backup version (timestamp)> -d <target storageId>\n";
+        exit(1);
+}
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-s"){
+		if($argc > $i){
+			$i++;
+			$storageIdSrc = $argv[$i];
+		}	
+	}else if($argv[$i] == "-g"){
+		if($argc > $i){
+			$i++;
+			$guid = $argv[$i];
+		}	
+	}else if($argv[$i] == "-d"){
+		if($argc > $i){
+			$i++;
+			$storageIdDest = $argv[$i];
+		}	
+		
+	}else if($argv[$i] == "-b"){
+		if($argc > $i){
+			$i++;
+			$version = $argv[$i];
+		}	
+	}
+}
+if(empty($guid) || $storageIdDest ==0 || $storageIdSrc==0 || $version ==0){
+	usage();
+	exit();
+}
+/* 
+if(!file_exists($jobJson)){
+	logger(LOG_ERR,"Job config file ($jobJson) not found");
+	exit(1);
+}
+$j = json_decode(file_get_contents($jobJson));
+if ($j === null && json_last_error() !== JSON_ERROR_NONE) {
+	logger(LOG_ERR,"Failed to parse job config file ($jobJson)");
+	echo "Failed to parse job config: $jobJson\n";
+	exit(1);
+} */
+
+
+$j = new stdClass();
+$dsSrc = null;
+$dsDest = null;
+
+try{
+	
+	$j->id = rand(1,1000);
+
+    $dsSrc = getDS($storageIdSrc,$guid);
+	$dsDest = getDS($storageIdDest,$guid);
+
+	try{
+        if(!$dsSrc->isMounted()){
+            echo "*********** We're not mounted.  Lets mount ****************\n";
+            $dsSrc->mount();
+        }
+    }catch(Exception $ex){
+        logger(LOG_ERR,"Error mounting DS: ".$ex->getMessage()." JobID $j->id");
+        exit(1);
+    }
+
+	if(!$dsSrc->haveBackup($version)){
+		die("Backup $version not found in source DS\n");
+	}
+	
+    try{
+        if(!$dsDest->isMounted()){
+            echo "*********** We're not mounted.  Lets mount ****************\n";
+            $dsDest->mount();
+        }
+    }catch(Exception $ex){
+        logger(LOG_ERR,"Error mounting DS: ".$ex->getMessage()." JobID $j->id");
+        exit(1);
+    }
+	if($dsDest->haveBackup($version)){
+		logger(LOG_INFO,"Destination already has Backup $version!");
+		exit(0);
+	}
+	
+	$res = doMirror($j, $guid, $version, $dsSrc, $dsDest );
+	
+	exit($res);
+
+}catch(Exception $ex){
+	logger(LOG_ERR, $ex->getMessage() );
+	exit(1);
+}finally{
+    if(is_object($dsSrc) ){
+        $dsSrc->unmount();
+    }
+	if(is_object($dsDest)){
+		$dsDest->unmount();
+	}
+
+}
+
+
+//	Run a backup of a single system
+//	The DS is already mounted for us, so these are our high-level steps
+
+//		-insert backup version in DB
+//
+function doMirror($job, $guid, $version, $dsSrc, $dsDest ){
+	$ret = 0;
+
+	$vm = getTarget($guid);
+
+	Joblog::log(LOG_INFO,"Starting mirror of backup $version of $vm->name ($guid) from $dsSrc->guid to $dsDest->guid");
+	$start = time();
+	
+
+	$workDir = "/tmp/mirror.vers.". rand(0,2000);
+	Joblog::log(LOG_DEBUG, "Using $workDir for mirror");
+	exec("mkdir -p $workDir");
+
+	$result = "pending";	
+	try{
+
+		// check dsSrc and dsDest exist
+		// check srcBackup exists 
+		// check dsDest doesn't already have backup
+
+		// pull down *.hcl to workDir from src and make unique (like purge)
+		// **** optimization: pull down previous backup on dest, make unique and diff with src
+		// loop over blocks, putting (haveBlock)
+		// send all other backup folder files (meta, logs, etc)
+		// record backup for dsDest
+
+		$sourceBlocks = "$workDir/sourceBlocks";
+		$existingBlocks = "$workDir/existingBlocks";
+		$blocksToSend = "$workDir/blocksToSend";
+
+		$sourceFiles = $dsSrc->listFiles($version);
+		$cnt =0;
+		foreach($sourceFiles as $f){
+			$parts = pathinfo($f);
+			if($parts['extension'] == "hcl"){                
+				$dsSrc->getFile("/$version/$f","$workDir/$cnt.scl");
+				$cnt++;
+			}
+		}
+		if($cnt ==0){ 
+			Joblog::log(LOG_INFO, "No HCLs found in source- Nothing to be mirrored.");
+			return;
+		}		
+		$cmd = "cat $workDir/*.scl | sed 's/CODA//' | sort -u  > $sourceBlocks";
+		Joblog::log(LOG_DEBUG, "Running $cmd");
+		exec($cmd);
+		exec("rm $workDir/*.scl");      // cleanup
+
+		$versions = $dsDest->listBackups();
+		if(!empty($versions)){
+				Joblog::log(LOG_INFO,"Found previous vault for differential send");
+				usort($versions, function($a, $b) { return basename($b) - basename($a); });				
+				$prev = $versions[0];
+				$lastFiles = $dsDest->listFiles($prev);
+				
+				foreach($lastFiles as $f){
+					$parts = pathinfo($f);
+					if($parts['extension'] == "hcl"){                
+						$dsSrc->getFile("/$version/$f","$workDir/$cnt.rcl");						
+					}
+				}
+				$cmd = "cat $workDir/*.rcl | sed 's/CODA//' | sort -u  > $existingBlocks";
+				Joblog::log(LOG_DEBUG, "Running $cmd");
+				exec($cmd);
+				exec("rm $workDir/*.rcl");      // cleanup
+				$cmd= "comm -23 $sourceBlocks  $existingBlocks > $blocksToSend";
+		}else{
+			exec("mv $sourceBlocks $blocksToSend");
+		}
+
+		if(!file_exists($blocksToSend)){
+			throw new Exception("Nothing to send?  The blocksToSend file was missing");
+		}
+
+
+		$totalBlocks = trim(shell_exec("cat $blocksToSend | wc -l"));
+
+		$progFile = "$workDir/prog.json";
+		$prg = new stdClass();
+		$prg->Progress =0;
+		file_put_contents($progFile, json_encode($prg));
+		
+		$loglet = Joblog::getLoglet("Mirroring backup $version of $vm->name", LOG_INFO);
+		$kidPid = getProgress($progFile, $loglet);     
+		try{
+			Joblog::log(LOG_DEBUG, "Starting transfer for mirror...");
+			$tmpBlockPath = "$workDir/tmpBlock";
+			if($totalBlocks > 0){
+				$i=0;
+				foreach(file($blocksToSend) as $line) {
+					try{
+						$block = trim("/blocks/" . substr($line, 0, 3) ."/$line");
+						
+						if(!$dsDest->haveFile($block)){
+							$dsSrc->getFile($block, $tmpBlockPath);
+							$dsDest->putFile($tmpBlockPath, $block);
+						}
+
+						$perc = ($i / $totalBlocks) * 100;    
+						$prg->Progress = round($perc, 2);
+
+						file_put_contents($progFile, json_encode($prg));
+
+						Joblog::log(LOG_DEBUG, "Send Block: $block");
+						$i++;
+					}catch(Exception $ex){
+						Joblog::log(LOG_ERR, "Failed to send block $block ". $ex->getMessage());
+					}
+				}
+			}else{
+				Joblog::log(LOG_INFO, "No new blocks to send!");
+			}
+			
+			$prg->Progress=100;
+			file_put_contents($progFile, json_encode($prg));
+			
+			foreach($sourceFiles as $f){
+				Joblog::log(LOG_DEBUG, "Putting $version/$f to remote");
+				$dsSrc->getFile("/$version/$f", $tmpBlockPath);
+				$dsDest->putFile($tmpBlockPath, "/$version/$f");
+			}
+			$loglet->setProgress(100);
+
+		}finally{
+			 posix_kill($kidPid, SIGKILL);	// end our progress thread rightly
+		}
+
+		recordBackup($guid, $version, $job->id, $dsDest);
+		$result = "success";
+
+
+	}catch(Exception $ex){		
+		$msg = "We had a failure with the mirror ($version)\n -->Error: ". $ex->getMessage();
+        Joblog::log(LOG_ERR,"$msg [$version, JobID $job->id]");
+		$result = "error";
+		return false;
+	}finally{
+		Joblog::log(LOG_DEBUG, "In finally with result: $result");
+		exec("rm -fr $workDir");
+	}
+    $elapsed = time() - $start;
+    Joblog::log(LOG_INFO,"Completed mirror version $version  in $elapsed seconds. [JobID $job->id]");
+	return true;
+}
+
+
+
+?>

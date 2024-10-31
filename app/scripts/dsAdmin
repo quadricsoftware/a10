@@ -1,0 +1,647 @@
+#!/usr/bin/php -q
+<?php
+include_once(__DIR__ ."/../libs/main_lib");
+include_once(__DIR__ ."/../libs/ds_lib");
+
+if($argc < 2){ usage(); }
+
+
+function usage(){
+	$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+        echo colorize("DS Manager tool", "yellow")."\n";
+        echo "Usage: \n";
+	echo "$me [ds] [create] <shareID> <guid <ds name> <cbt 0|1> <retention 0=disable> <blocksize MB>\n";
+	echo "$me [ds] [info] <shareID> <guid>\n";
+	echo "$me [ds] [mount] <shareID> <guid>\n";
+	echo "$me [ds] [unmount] <shareID> <guid>\n";
+        echo "$me [ds] [import] <shareID> <guid> (QDS file must exist on storage)\n";
+        echo "$me [ds] [forget] <shareID> <guid> (Drops from DBs only)\n";
+        echo "$me [ds] [cbt-state] <shareID> <guid> [reset]  (Optional reset resets ds info only)\n";
+	echo "$me [ds] [purge] <shareID> <guid> <ts to purge> (deletes a backup from DS)\n";
+        
+        echo "$me [storage] <add> <name> <type 0=local, 1=cifs, 2=nfs, 3=S3> <path> <user> <pass> <context> <options>\n";
+        echo "$me [storage] <list> <storageid>\n";
+
+        echo "$me [host] <add> <name> <guid> <type> <ip> <user> <pass>\n";
+        echo "$me [host] <list>\n";
+        echo "$me [host] <enum> <id> (query the host to detect vms and meta information)\n";
+
+        exit(1);
+}
+
+//      storage list
+//      *storage add
+//              required:  (type, name, desc, path, user, pass, context, options)
+//              local: type, name, desc, path
+//              nfs:            type, name, desc, path
+//              cifs:           type, name, desc, path, user, pass
+//              cloud:          tpe, name, desc, path (endpoint), user (key), pass (secret). context (bucket), options (region)
+
+//      *storage scan: looks for .qds files and imports them (what about cloud)
+//      *storage forget:      [storageid]     -> deletes all backups w/ storage guid and removes & unmounts storage
+//      ds import:      [storageid] [guid] -> looks for ds.json and imports all backups
+//      ds forget:      [storageid] [guid]     -> deletes all backups w/ ds  guid and removes & unmounts storage
+if($argv[1] == "report"){
+        $all = dbGetArray("main", "SELECT id from storage");
+        echo  count($all)." Storage defined.\n";
+        foreach($all as $a){
+                try{
+                        $st = getStorage($a);                        
+                        getStorageInfo($st);
+                }catch(Exception $ex){
+                        echo " **Failed to get Storage ($a):". $ex->getMessage() ."\n";
+                }
+        }
+        
+}else if($argv[1] == "joblog"){
+        if($argc < 3){
+                echo "We need a joblog id to view!\n";                
+                exit(1);
+        }
+        $id = $argv[2];        
+        $all = dbGet("joblog", "SELECT * from joblog where jobid=?", array($id));
+        
+        foreach($all as $e){                
+                // id, timestamp, elapsed jobid, guid, level, progress, text        
+                $lvl = $e->level;
+	        $out = colorize(date('M d H:i:s', strtotime($e->timestamp)), "grey");
+                $out .= " [".$e->elapsed."s] $e->progress%";
+
+                if($lvl == LOG_WARNING){ $out .= colorize(" [$lvl] $e->text", "yellow"); }
+                else if($lvl == LOG_ERR){ $out .= colorize(" [$lvl] $e->text", "red"); }
+                else if($lvl == LOG_INFO){ $out .= colorize(" [$lvl] $e->text", "blue"); }
+                else if($lvl == LOG_DEBUG){ $out .= colorize(" [$lvl] $e->text", "grey"); }
+                echo "$out\n";
+        }
+
+}else if($argv[1] == "ds"){
+        if($argc < 4){
+                echo "Incorrect parameter count\n";
+                echo "Sub command options: create, info, mount, unmount, import, forget, purge\n";
+                exit(1);
+        }
+        $cmd = $argv[2];
+        $sid = $argv[3];
+        //$guid = $argv[4];
+        $st = null;
+        try{
+                $st = getStorage($sid);                
+        }catch(Exception $ex){
+                echo "Failed to get Storage ($sid).\n". $ex->getMessage() ."\n";
+                return;
+        }
+        
+        if($cmd =="cbt-state"){
+                $guid = $argv[4];          
+                $ds = getDS($sid, $guid);
+                if(!$ds->exists()){
+                        die("Cannot find DS.\n");
+                }
+                echo "Getting CBT state for  $guid on Storage: $st->name\n";
+                $inf = $ds->getInfo();
+                echo "$inf->name [$inf->blocksize MB]: ";
+                if(empty($inf->cbtTs) || $inf->cbtTs ==0){
+                        echo "CBT is not enabled/in use for $inf->name\n";
+                        return;
+                }else if($ds->haveBackup($inf->cbtTs)){
+                        echo "Backup $inf->cbtTs exists in storage. CBT VDI(s):\n";
+                        $meta = json_decode($ds->getFileContents("$inf->cbtTs/meta.json"));
+                        foreach($meta->disks as $d){
+                                echo "Disk $d->position ($d->size bytes), vdi: $d->vdi\n";
+                        }
+                        
+                }else{
+                        echo "Backup $inf->cbtTs not found in storage!\n";
+                }
+                if($argc == 6 && $argv[5] == "reset"){
+                        $inf->cbtTs = 0;
+                        $ds->setInfo($inf);
+                        echo "CBT State reset for $inf->name\n";
+                }
+                
+        }else if($cmd =="import"){      
+                if($argc < 5){
+                        die("No DS guid provided!\n");
+                }    
+                $guid = $argv[4]; 
+                $ds = getDS($sid, $guid);       
+                if(!$ds->exists()){
+                        die("Cannot find DS to import.\n");
+                }
+                try{
+                        $ds->mount();
+                }catch(Exception $ex){
+                        die("Failed to mount DS for import: ". $ex->getMessage() );
+                }
+                $backups = $ds->listBackups();                        
+                foreach($backups as $b){                        
+                        recordBackup($guid, $b, 0, $ds);
+                }
+                $st->addDS($guid);
+                echo "Import complete.\n";
+                exit(0);
+                
+        }else if($cmd =="forget"){      
+                $guid = $argv[4];          
+                $ds = getDS($sid, $guid);
+                if(!$ds->exists()){
+                        die("Cannot find DS to forget.\n");
+                }
+                echo "Forgetting all backups for $guid on Storage: $st->name\n";
+                $sql = "DELETE from backups where storageId=? and guid=?";
+                dbSet("main", $sql, array($sid, $guid));
+                
+        }else if($cmd == "create"){
+                if($argc < 6){
+                        echo "Incorrect parameter count\n";
+                        echo "Usage: create [sid] [guid] [ds name] <cbt 0|1> <retention 0=disable> <blocksize MB>\n";
+                        exit(1);
+                }
+                
+                $guid = $argv[4];
+                $name = $argv[5];
+
+                $cbt = 0;
+                $bs = 4;
+                $ret = 5;
+                if(isset($argv[6])){ $cbt = $argv[6]; }
+                if(isset($argv[7])){ $ret = $argv[7]; }
+                if(isset($argv[8])){ $bs = $argv[8]; }
+                
+                
+                $ds = getDS($sid, $guid);
+                if($st->type ==3){			// cloud
+                        echo "Cloud type\n";
+                }else{
+                        $tp = "Local";
+                        if($st->type == 1){ $tp = "CIFS";}
+                        if($st->type == 2){ $tp = "NFS";}
+                        echo "Storage Type: $tp\n";
+                }
+                try{
+                        $ds->create($name, $bs, $ret, $cbt);
+                        //$st->addDS($guid);    the ds->create() does this now
+                }catch(Exception $ex){
+                        echo "Failed to create DS: ". $ex->getMessage() ."\n";
+                }        
+        }else if($cmd == "mount"){
+                if($argc != 5){
+                        echo "Incorrect parameter count $argc\n";
+                        exit(1);
+                }
+                $guid = $argv[4];
+                $ds = getDS($sid, $guid);
+                $ds->mount();
+        }else if ($cmd == "unmount"){
+                if($argc != 5){
+                        echo "Incorrect parameter count\n";
+                        exit(1);
+                }                
+                $guid = $argv[4];
+                $ds = getDS($sid, $guid);
+                $ds->unmount();
+        }else if ($cmd == "purge"){
+                if($argc != 6){
+                        echo "Incorrect parameter count ($argc)\n";
+                        usage();
+                        exit(1);
+                }
+                $guid = $argv[4];     
+                $vers = $argv[5];     
+                $ds = getDS($sid, $guid);
+                //$ds->mount()                
+                $ds->purge($vers);
+                
+        }else if($cmd == "list"){
+                if($argc == 4){
+                        echo " No DS guid provided.  Please choose one of the following:\n";                        
+                        $dss = $st->listDS();
+                        foreach($dss as $d){ 
+				$name = colorize("Unknown system (not in DB)","yellow");
+				try{
+					$tmp = dbGetColumn("main","SELECT name from targets where guid=?", array($d));
+					if(!empty($tmp)){ $name = colorize($tmp,"blue"); }
+				}catch(Exception $ex){}
+				echo "\t$d [$name]\n";
+			}
+                        exit(1);
+                }
+                
+                $guid = $argv[4];
+                $ds = getDS($sid, $guid);
+                $backups = $ds->listBackups();
+                foreach($backups as $b){
+                        $utcDateTime = new DateTime("@$b");
+                        $utcDateTime->setTimezone(new DateTimeZone('UTC'));
+                        $type = "";
+                        $test = dbGetOne("main", "SELECT * from backups where timestamp=? and guid=? and storageId=?", array($b, $guid, $sid));
+                        if(is_object($test)){
+                                $type = $test->type;
+                                if($type == "purge"){ $type = colorize($type, "red");}
+                        }
+                        echo "[".colorize($b, "yellow")."] ". $utcDateTime->format('Y-m-d H:i:s T') ." $type\n";
+                }
+
+        }else if($cmd == "info"){
+                if($argc == 4){
+                        echo " No DS guid provided.  Please choose one of the following:\n";                        
+                        $dss = $st->listDS();
+                        foreach($dss as $d){ echo "\t$d\n";}
+
+                        exit(1);
+                }
+                $guid = $argv[4];
+                if(!$st->haveDS($guid)){
+                        die("Storage does not have a DS for $guid\n\n");
+                }
+                
+                
+                $ds = getDS($sid, $guid);
+                
+		$dsInfo = $ds->getInfo();
+                if(isset($argv[5]) && $argv[5] == "set" && $argc ==8){
+                        $which = $argv[6];
+                        if($which == "retain"){
+                                $dsInfo->retention = $argv[7];
+                        }else if($which == "name"){
+                                $dsInfo->name = $argv[7];
+                                echo "New name: $argv[7]\n";
+                        }else if($which == "cbt"){
+                                $dsInfo->cbtEnable = $argv[7];
+                        }else if($which == "cbtTs"){
+                                $dsInfo->cbtTs = 0;
+                        }
+                        print_r($dsInfo);
+                        $ds->setInfo($dsInfo);
+                }
+                if($st->type ==3){                       
+
+                        echo "DS Name: ".colorize("$dsInfo->name", "yellow")."\n";
+                        echo "Storage: $st->name [Type: Cloud]\n";                        
+                        echo "Bucket: $st->context\n";
+                        echo "Endpoint: $st->path\n";
+                        echo "Region: $st->options\n";
+                        
+                        if($ds->isMounted() == true){
+                        //echo "Mounted: ". $ds->getPath() ."\n";
+                        $backs = $ds->listBackups();
+                        echo "Backups in DataStore: ". count($backs) ."\n";
+                        echo "Retention: $dsInfo->retention\n";
+                        echo "CBT Enabled: ". (($dsInfo->cbtEnable) ? "true" : "false") ;
+                        echo "\nCBT Last: $dsInfo->cbtTs";
+                        echo "\nSize: ". $ds->getSize() ."\n";
+                        }else{ echo "Mounted: No\n"; }
+                }else{
+                        echo "DS Name: ".colorize("$dsInfo->name", "yellow")."\n";
+                        $tp = "Local";
+                        if($st->type == 1){ $tp = "CIFS";}
+                        if($st->type == 2){ $tp = "NFS";}
+                        echo "Storage: $st->name [Type: $tp]\n";
+                        
+                        
+                        echo "DS Path: $st->path\n";
+                        if($ds->isMounted() == true){
+                        echo "Mounted: ". $ds->getPath() ."\n";
+                        $backs = $ds->listBackups();
+                        echo "Backups in DataStore: ". count($backs) ."\n";
+                        echo "Rentention: $dsInfo->retention\n";
+                        echo "Size: ". $ds->getSize() ."\n";
+                        echo "CBT Enabled: ".($dsInfo->cbtEnable) ? "true" : "false" ."\n";
+                        }else{
+                        echo "Mounted: No\n";
+                        }
+                }
+        }
+        exit(0);
+
+}else if($argv[1] == "targets"){
+        if($argc == 2){
+                die( "[targets] Need more details.\nOptions: [list]\n\n");                
+        }
+        if($argv[2] == "list"){
+                //guid TEXT, name TEXT, poolid TEXT, type INTEGER, ip TEXT, agent TEXT, cpu INTEGER, memory INTEGER, os TEXT, size INTEGER)";
+
+                $targets = dbGet("main", "SELECT * from targets order by poolid, name");
+                foreach($targets as $t){
+                        $os = "";
+                        if(!empty($t->os)){ $os = "($t->os)";}
+                        $ip = "";
+                        if(!empty($t->ip)){ $ip = "($t->ip)";}
+                        $size= prettyBytes($t->size);
+                        $ram = prettyBytes($t->memory);
+                        echo "($t->id) [$t->guid] $t->name \t $ip $t->cpu CPUs, $ram RAM, OS: $os, TotalSize: $size\n";                        
+                } 
+        }
+}else if($argv[1] == "host"){        
+        if($argc == 2){
+                die( "[host] Need more details.\nOptions: [add] [delete] [enum] [list]\n\n");
+                
+        }
+        if($argv[2] =="add"){
+                if($argc != 8){
+                        echo "Incorrect parameter count ($argc)\n";
+                        echo "Usage: [host] <add> <name> <type> <ip> <user> <pass>\n";
+                        exit(1);
+                }
+                try{
+                        $name = $argv[3];                        
+                        $type = $argv[4];                        
+                        $ip = $argv[5];
+                        $user = "";
+                        $pass = "";
+                        if($type == 2){
+                                $user = $argv[6];
+                                $pass = $argv[7];
+                        }
+                        addHost($name, $ip, $type, $user, $pass);
+                }catch(Exception $ex){
+                        echo "Failed to add host.\nError: ". $ex->getMessage() ."\n";
+                }
+        }else if($argv[2] == "list"){
+                $hosts = dbGet("main", "SELECT id, name, guid, type, ip from hosts");
+                foreach($hosts as $h){
+                        echo "Host: [$h->id] $h->name ($h->ip) [$h->guid]\n";                        
+                }                
+        }else if($argv[2] == "delete"){
+                $id = $argv[3];
+                $h = getHost($id);
+                if(!is_object($h)){  die("Error:  Host ID: $id not found in db!\n"); }
+
+                dbSet("main", "DELETE from hosts where id=?", array($id));
+                echo "Host id:$id deleted.\n";
+        }else if($argv[2] == "enum"){
+                if($argc != 4){
+                        echo "Incorrect parameter count ($argc)\n";
+                        echo "Please provide a host to enumerate\n";
+                        exit(1);
+                }
+                $h = getHost($argv[3]);
+                if(!is_object($h)){
+                        die("Failed to load host ID ".$argv[3]." from db\n");
+                }
+                if($h->type == XEN){
+                        // this is pretty beefy
+                        $res = xenCmd($h->ip, $h->username, $h->password, "vm-list-details");                        
+                        setTargets($res);
+                        echo "Updated ". count($res). " VMs\n";
+                }else if($h->type == HV){
+
+                        echo "HV!\n";
+                        include_once(__DIR__."/../libs/hv_lib");
+                        $vms = \HV\listVms($h->ip);
+                        foreach($vms as $v){
+                                $v->poolid = $h->guid;
+                                echo "VM: ". print_r($v) ."\n";
+                        }
+                        setTargets($vms);
+                }
+        }
+        exit(0);
+}else if($argv[1] == "storage"){
+        if($argc < 3){
+                echo "Incorrect parameter count $argc\n";
+                echo "Storage options: [mount] [unmount] [add] [forget] [list] [scan]\n";
+                exit(1);
+        }
+
+        if($argv[2] == "mount"){
+                if($argc != 4){
+                        echo "Incorrect parameter count $argc\n";
+                        exit(1);
+                }
+                $st = getStorage($argv[3]);
+                $st->mount();
+        }else if($argv[2] == "unmount"){
+                if($argc != 4){
+                        echo "Incorrect parameter count $argc\n";
+                        exit(1);
+                }
+                $st = getStorage($argv[3]);                
+                $st->unmount();
+        }else if($argv[2] =="add"){
+                if($argc < 6 ){
+                        echo "Incorrect parameter count ($argc)\n";
+                        echo "Usage: [storage] <add> <name> <type 0=local, 1=cifs,2=nfs,3=S3> <path> <other options> \n";
+                        echo "Local ex: storage add 'Local Backup Folder' 0 /mnt/backupfolder\n";
+                        echo "CIFS ex: storage add 'Main SMB Server' 1 //192.168.1.2/Share/backups backupuser password\n";
+                        echo "NFS ex: storage add 'Main NFS Server' 2 192.168.1.2:/Share/backups\n";                        
+                        echo "S3 ex: storage add 'Cloud Backups' 3 https://s3.endpoint.com AccessKey SecretKey BucketName us-east-1\n";
+                        echo "\n";
+                        exit(1);
+                }
+                // types:
+                //  0 = Local disk/device (not managed)
+                //  1 = CIFS/SMB
+                //  2 = NFS
+                //  3 = Cloud (s3 compat.)
+                $name = $argv[3];                        
+                $type = $argv[4];
+                $path = $argv[5];
+                $user = "";
+                $pass = "";
+                $bucket = "";
+                $region = "";
+
+                if($type == 1){                                
+                        $user = $argv[6];
+                        $pass = $argv[7];
+                }else if($type == 3){
+                        $user = $argv[6];
+                        $pass = $argv[7];
+                        $bucket = $argv[8];
+                        $region = $argv[9];
+                }
+                
+                try{
+                        addStorage($name, $name, $type, $path, $user, $pass, $bucket, $region);
+                        
+                }catch(Exception $ex){
+                        echo "\nFailed to add storage.\nError: ". $ex->getMessage() ."\n";
+                }
+        }else if($argv[2] == "list"){
+                if($argc == 4 ){
+                        
+                        try{
+                                $st = getStorage($argv[3]);
+                                echo "Listing all known DataStores on $st->name:\n";
+
+                                $dss = $st->listDS();
+                                foreach($dss as $d){
+                                        $name = colorize("Unknown system (not in DB)","yellow");
+                                        try{
+                                                $tmp = dbGetColumn("main","SELECT name from targets where guid=?", array($d));
+                                                if(!empty($tmp)){ $name = colorize($tmp, "yellow"); }
+                                        }catch(Exception $ex){}
+                                        $sz = "N/A";
+                                        if($st->type != 3){
+                                                $sz = trim(shell_exec("du -hs ".$st->getBasePath()."/$d.qds"));
+                                                $sz = substr($sz, 0, strpos($sz, "\t"));
+                                        }
+                                        
+                                        echo "DS: $name [$d] [$sz]\n";
+
+                                }
+                                
+
+                        }catch(Exception $ex){
+                                die("Failed to get storage id ".$argv[3]."\nError:". $ex->getMessage(). "\n");
+                        }
+                        exit();
+                } else{
+                        echo colorize("All known storage:\n", "blue");
+                        $storage = dbGet("main", "SELECT * from storage");
+                        foreach($storage as $st){
+                                echo "Name: ". colorize("$st->name [ID:$st->id]\n", "yellow");
+                                if($st->type == 0){ $typeStr = "Local Storage";}
+                                else if($st->type == 1){ $typeStr = "CIFS Storage";}
+                                else if($st->type == 2){ $typeStr = "NFS Storage";}
+                                else if($st->type == 3){ $typeStr = "Cloud Storage (S3)";}
+                                echo "Type: $typeStr ($st->type)\n";
+                                
+                                if($st->type ==3){
+                                        echo "Endpoint: $st->path [Region: $st->options]\n";
+                                        echo "Bucket: $st->context\n\n";
+                                }else{
+                                        echo "Path: $st->path\n\n";
+                                }
+                                //echo "Storage: $h->name ($h->ip) [id:$h->id]\n";
+                                //echo "Guid: $h->guid\n";
+                        }
+                        echo "Note: Use storage list <storageid> to see DataStores in storage\n";
+                }            
+        }else if($argv[2] == "forget"){
+                $id = $argv[3];
+                try{
+                        $s = getStorage($id);
+                }catch(Exception $ex){
+                        die("Error:  Storage ID: $id not found in db!\n"); 
+                }
+                echo "Forget Storage and drop backups from local DB?\nStorage will not be touched. \nContinue (y/n): ";
+                $resp = readline();
+                if(strtolower($resp) !='y'){
+                        exit(0);
+                }
+                echo "Removing backups from db\n";
+                echo "Removing ds from db\n";
+                echo "Removing storage from db\n";
+
+                //dbSet("main", "DELETE from storage where id=?", array($id));
+                //echo "Storage id:$id deleted.\n";
+        }else if($argv[2] == "scan"){
+                if($argc != 4 ){
+                        die("No storageId provided to scan\nThis will discover all DSs on the storage, and import their backups to the local DB.");
+                }
+                $id = $argv[3];
+                $st = null;
+                try{
+                        $st = getStorage($id);                        
+                }catch(Exception $ex){
+                        die("Error:  Storage ID: $id not found in db!\n"); 
+                }
+                if($st->type == 3){
+                        echo "Warning!\nThis is a very slow operation on cloud storage.\n";
+                        echo "This will cause many GET operations (depending on the size/number of backups stored remotely).\n";
+                        echo "Alternatively, you can import each DS individually, which is much more efficient:\n";
+                        echo "\t$argv[0] ds import $id (guid to import)\n\n";
+                        echo "Continue with scan (y/n): ";
+                        $resp = readline();
+                        if(strtolower($resp) !='y'){
+                                echo "Exiting.\n";
+                                exit(0);
+                        }
+                        echo "Scanning cloud storage now...\n";
+                }else{
+                        echo "Looking for all DataStores on Storage...\n";
+                }
+                try{
+                        $st->mount();
+                
+                        // let's wipe the datastore array first
+                        $raw = json_decode($st->getFileContents("/storage.json") );
+                        $raw->datastores = array();
+                        $st->putFileContents(json_encode($raw), "/storage.json");
+
+                        $dss = $st->scan();
+                        if(empty($dss)){
+                                die("No DSs found in storage!\n\n");
+                        }
+                        foreach($dss as $guid){
+                                $ds = getDS($id, $guid);                                
+                                if(!$ds->exists()){
+                                        echo("Cannot find DS to import ($guid).\n");
+                                        continue;
+                                }
+                                try{
+                                        $name = colorize("Unknown GUID (system not in local DB)","yellow");
+                                        try{
+                                                $tmp = dbGetColumn("main","SELECT name from vms where guid=?", array($guid));
+                                                if(!empty($tmp)){ $name = $tmp; }
+                                        }catch(Exception $ex){}
+
+                                        echo "Mouting $guid [$name]\n";
+                                        $ds->mount();
+                                        echo "Done mounting\nListing backups\n";
+                                        $backups = $ds->listBackups();
+                                        foreach($backups as $b){                        
+                                                recordBackup($guid, $b, 0, $ds);
+                                        }
+                                        $st->addDS($guid);
+                                }catch(Exception $ex){
+                                        echo "Failed to mount DS for import: ". $ex->getMessage() ,"\n";
+                                }finally{
+                                        $ds->unmount();
+                                }                        
+                        }
+                }finally{
+                        $st->unmount();
+                }
+
+        }
+        return;
+}
+
+
+else{
+	echo "Unknown command: $argv[1]\n";
+	usage(); 
+	exit(1);
+}
+
+function checkMount($path){
+	if(!is_dir($path)){
+                die("Path not found: $path\n");
+        }
+        $res = shell_exec("grep $path /proc/mounts");
+        if(empty($res)){
+                die("Path not mounted: $path $res\n");
+        }
+
+}
+
+exit();
+
+function getStorageInfo($st){
+                
+        //$ds = getDS($sid, $guid);
+        
+        if($st->type ==3){
+                echo "Storage: [$st->id] $st->name [Type: Cloud]\n";                
+                echo "Bucket: $st->context\n";
+                echo "Endpoint: $st->path\n";
+                echo "Region: $st->options\n";                
+        }else{
+                $tp = "Local";
+                if($st->type == 1){ $tp = "CIFS";}
+                if($st->type == 2){ $tp = "NFS";}
+                echo "Storage: $st->name [Type: $tp]\n";
+                
+        }
+        echo "Found the following DSs:\n";
+        $dss = $st->listDS();
+        foreach($dss as $d){ echo "\t$d\n";}
+        
+
+}
+
+
+?>

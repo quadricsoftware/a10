@@ -1,0 +1,576 @@
+<?php
+include_once(__DIR__."/common_lib");
+
+
+
+////////////////////////////////////////////////////  DS Stuff
+// 
+// These functions are mostly for the ds_lib folks
+//
+
+// mount the filssystem inside our Qcow2 file (which is mounted on an nbd)
+//
+function mountDSFS($local, $nbd){
+        if(isNbdMounted($nbd)){
+                throw new Exception("Requested ndb ($nbd) is already mounted!");
+        }
+        if(isDSMounted($local)){
+                throw new Exception("DS file ($local) is already mounted!");
+        }
+        $cmd = "sudo mount -t btrfs $nbd $local";
+	logger(LOG_DEBUG,"Mounting DS ($nbd) to $local ($cmd)");
+        $res = "";
+        $code = 0;
+        exec($cmd, $raw, $code);
+        foreach($raw as $l){ $res = $l . "\n"; }
+        if($code != "0"){ 
+		throw new Exception("Failed to mount btrfs on DS: $res");
+	}
+}
+
+
+
+function isDSMounted($lp){
+        $output = trim(shell_exec("findmnt $lp"));
+        if(empty($output)){ return false; }
+        return true;
+}
+
+
+function isNbdMounted($nbd){
+    echo "\nThis is a noop call (isNbdMounted)!  Please fix it\n";
+    false;
+}
+
+function mountQC($file){
+	$rawBase = getSetting("baseShare");
+	// check if $file is already mounted
+	$test = preg_replace('#\.qds$#', '', $file);
+	$test = preg_replace("#^$rawBase/#", '', $test);
+	$res = trim(shell_exec("lsblk | grep $test"));
+	if(!empty($res) ){
+		echo "$file is already mounted\n";
+		return;
+	}
+
+    $nbdDevices = glob('/sys/block/nbd*', GLOB_ONLYDIR);
+    $winner = null;
+    foreach ($nbdDevices as $nbdDevice) {
+        $size = trim(file_get_contents("$nbdDevice/size", false, null, 0, 1));
+        if (empty($size)) {
+            $winner = basename($nbdDevice);
+            break;
+        }
+    }
+    if ($winner === null) {
+            throw new Exception("No free nbd device available!");            
+    }
+	echo "Mounting $file on $winner\n";
+        $winner = "/dev/$winner";
+        $cmd = "sudo qemu-nbd --connect=$winner $file";
+        $res = shell_exec($cmd);
+	if(empty($res)){
+		logger(LOG_DEBUG, "Mounted Qcow: $res");
+		$res = shell_exec("lsblk $winner");
+		logger(LOG_DEBUG,"lsblk: $res");
+		return $winner;
+	}else{ 
+		throw new Exception("Failed to mount Qcow: $res\n$cmd");
+	}
+}
+
+
+
+
+///////////////////////////////////////////////////////////////
+function getStorage($id){	
+	
+	try{
+		$st = getStorageDB($id);		
+		if($st->type ==3){
+			return new StorageCloud($st);
+		}else{
+			return new StorageLocal($st);
+		}
+	}catch(Exception $ex){
+		throw new Exception("Failed to create Storage ($id) with error: ". $ex->getMessage());
+	}
+}
+
+function addStorage($name, $desc, $type, $path, $user, $pass, $context, $options){
+
+	// test it, add it to db, then push the storage.json to the root
+	$path = rtrim($path, "/");
+
+	$tmp = new stdClass();
+	$tmp->id = 0;		
+	$tmp->type = $type;
+	$tmp->path = $path;
+	$tmp->name = $name;
+	$tmp->desc = $desc;
+	$tmp->user = $user;
+	$tmp->pass = $pass;
+	$tmp->context = $context;
+	$tmp->options = $options;
+	$tmp->guid = makeGuid();
+
+	
+	testStorage($tmp);	// throws if there are troubles
+	
+
+	$cnf = new stdClass();
+	$cnf->name = $name;
+	$cnf->guid = $tmp->guid;
+	$cnf->borndate = time();
+	$cnf->datastores =[];
+	$json = json_encode($cnf);
+	$jconf = tempnam("/tmp/", 'jcf.tmp');
+	file_put_contents($jconf, $json);
+	
+	$st = null;
+	if($type == 3){
+		$st = new StorageCloud($tmp);
+	}else {
+		$st = new StorageLocal($tmp);
+	}
+	$id = dbSet("main", "INSERT into storage values(null,?,?,?,?,?,?,?,?,?)", array($tmp->guid, $name, $name, $type, $path, $user, $pass, $context, $options));
+	
+	try{
+		$st = getStorage($id);
+		$st->mount();
+		// check for existing JSON
+		//	if exists, pull it down and update our guid?
+		if($st->haveFile("/storage.json")){
+			$guy = json_decode($st->getFileContents("/storage.json"));
+			dbSet("main", "update storage set guid=? where id=?", array($guy->guid, $st->id));
+		}else{
+			$st->putFile($jconf, "/storage.json");
+		}	
+		$st->unmount();
+	}catch(Exception $ex){
+			dbSet("main", "DELETE from storage where id=?", array($id));
+	}finally{
+		unlink($jconf);
+	}
+}
+function testStorage($st){
+	if($st->type ==3){
+		// cloud.  Do our own thing, as clouds work differently
+		$obj = new stdClass();
+        $obj->Bucket = $st->context;
+        $obj->Endpoint = $st->path;
+        $obj->Region = $st->options;
+        $obj->AccessKey = $st->user;
+        $obj->SecretKey = $st->pass;
+        $confPath = tempnam("/tmp/", 'ds.tmp');
+        file_put_contents($confPath, json_encode($obj));
+
+        $res = runCloudTool("-stat /test.file", $confPath);
+		//print_r($res);
+		unlink($confPath);
+
+        if($res->result != "success"){
+            throw new Exception("Failed to access cloud storage. Error: $res->message");
+        }				
+	}
+	
+	$lp = "/mnt/tmp";
+	// the rest can share some tests
+	if($st->type == 1){
+		// cifs
+		if(empty($st->user) || empty($st->pass)){ throw new Exception("Invalid/Empty credentials supplied!");}
+		$cmd = "sudo mount -t cifs -o username=$st->user,password=$st->pass,uid=1000,nobrl $st->path $lp 2>&1";
+		if(!empty($st->context)){
+			$cmd = "sudo mount -t cifs -o username=$st->user,password=$st->pass,domain=$st->context,uid=1000,nobrl $st->path $lp 2>&1";
+		}
+		exec($cmd, $out, $code);
+		if ($code !== 0) {
+			throw new Exception("Failed to mount cifs: $st->path Error: ". implode("\n", $out));
+		}
+		logger(LOG_DEBUG, "Suceeded mounting cifs $st->path");
+
+	}else if($st->type == 2){
+		// nfs
+		
+		exec("mkdir -p $lp");
+		$success = false;
+		$opts = array("vers=4.2", "vers=4.1", "vers=4.0", "vers=3");
+		$out = [];
+		foreach($opts as $opt){
+			$out = [];
+			$cmd = "sudo mount -t nfs -o async,noac,nolock,noatime,nodiratime,user,rw,soft,intr,$opt $st->path $lp 2>&1";
+			exec($cmd, $out, $code);
+			if ($code === 0) {
+				logger(LOG_DEBUG, "NFS ($st->path) $opt succeeded");
+				$st->option = $opt;
+				$success = true;
+				break;
+			}else{
+				//print_r($out);
+			}
+		}
+		if($success == false){
+			throw new Exception("Failed to mount NFS share on any version: $st->path. Error: ". implode("\n", $out));
+		}		
+
+	}else if($st->type == 0){		
+		// local path
+		if(!is_dir($lp)){
+			throw new Exception("Local path not found: $st->path");
+		}
+		$lp = $st->path;
+	}
+	if (!is_writable($lp)) {
+		throw new Exception("Local path is not writable: $lp");
+	}
+	$temp = $lp . '/temp_' . uniqid();
+	if (@file_put_contents($temp, 'Test') === false) {
+		throw new Exception("Unable to write to directory: $lp");
+	}
+	@unlink($temp);
+	// we're good!
+	if($st->type ==1 || $st->type==2){
+		logger(LOG_DEBUG, "Unmouting $lp");
+		exec("sudo umount $lp");
+	}
+}
+
+
+// types:
+//  0 = Local disk/device (not managed)
+//  1 = CIFS/SMB
+//  2 = NFS
+//  3 = Cloud (s3 compat.)
+abstract class StorageBase { 
+
+    public readonly string $guid;
+    public int $type;
+    public int $id;
+	public string $path;
+	public string $name;
+	public string $desc;
+	public string $user;
+	public string $pass;
+	public string $context;
+	public string $options;
+
+
+    public function __construct($st) {	
+		$this->id =0;
+		if(isset($st->id)){	
+        	$this->id = $st->id;
+		}
+		
+		$this->type = $st->type;
+		$this->path = $st->path;
+		$this->name = $st->name;
+		$this->desc = $st->desc;
+		$this->user = $st->user;
+		$this->pass = $st->pass;
+		$this->context = $st->context;
+		$this->options = $st->options;
+        $this->guid = $st->guid;
+    }
+
+	function getBasePath(){ }
+
+	function putFile($src, $dst){	}
+
+	function addDS($guid){}
+	function listDS(){}
+	function mount(){}
+	function unmount(){}
+	function scan(){}
+	function haveDS($guid){}
+}
+
+
+//	listDataStores()	// return a list of the contents of the storage.json datastores[]
+//	scan 				// heavy- looks for all .qds files, or cloud stuff
+//	forget				// drop all DSs from datastores in storage.json, and drop all backups from those
+
+
+class StorageLocal extends StorageBase {	
+
+	private string $basePath = "";
+	private string $lockFile = "";
+	private bool $isMounted =false;
+
+    public function __construct($st) {
+        parent::__construct($st);		
+		if($st->type ==0){
+			$this->basePath = rtrim($st->path, "/");					// wherever the local storage was mounted to (eg /mnt/local)
+		}else{
+			$this->basePath = getSetting("baseShare") ."/$st->id";		// eg. /mnt/raw
+		}
+		exec("mkdir -p $this->basePath");
+		$this->lockFile = "/tmp/share.".$this->id .".lock";
+		$this->isMounted =false;
+    }
+
+	public function getBasePath(){ 
+		return $this->basePath;
+	}
+
+	
+	private function incrementRefCount($amt=1){
+		if($amt > 0 && $this->isMounted){ 
+			logger(LOG_DEBUG, "No double share mounting.");
+			return; 
+		}else if($amt < 0 && $this->isMounted ==false){
+			logger(LOG_DEBUG, "No double share unmounting.");
+			return; 
+		}
+
+        $lockFile = fopen($this->lockFile, 'c');
+        if ($lockFile === false) {
+            throw new Exception("Failed to open lock file: {$this->lockFile}");
+        }
+
+        if (flock($lockFile, LOCK_EX | LOCK_NB)) {
+			if($amt > 0){
+	            $this->isMounted =true;
+			}else{
+				$this->isMounted =false;
+			}
+			$refCount = (int)file_get_contents($this->lockFile);
+            $refCount+=$amt;
+            file_put_contents($this->lockFile, $refCount);
+            flock($lockFile, LOCK_UN);
+        } else {
+			throw new Exception("No bueno");
+            $refCount = (int)file_get_contents($this->lockFile);
+        }
+        fclose($lockFile);
+		logger(LOG_DEBUG,"Incremented $amt Storage refCount for $this->id: $refCount $this->lockFile");
+        return $refCount;
+	}
+
+	function mount(){
+		if($this->type ==0 || $this->type ==3){ return; }	// local and cloud types don't mount anything
+		else{
+			$lp = getSetting("baseShare")."/$this->id";			
+
+			$output = shell_exec("grep $lp /proc/mounts");
+			if (strpos($output, $lp) !== false) {  
+				$this->incrementRefCount(1);
+				return;
+			}	// we're already mounted
+		
+			exec("mkdir -p $lp");
+			$cmd = "";
+			if($this->type ==1){
+				// CIFS Shares-- reminder: nobrl is vital for QCow2
+				$cmd = "sudo mount -t cifs -o username=$this->user,password=$this->pass,uid=1000,nobrl $this->path $lp";
+				if(!empty($this->context)){
+					$cmd = "sudo mount -t cifs -o username=$this->user,password=$this->pass,domain=$this->context,uid=1000,nobrl $this->path $lp";
+				}
+			}else if($this->type ==2){				
+				$opt= "";
+				if(!empty($this->options)){ $opt = ",".$this->options; }	// pull in any defined options (comma separated list)
+				$cmd = "sudo mount -t nfs -o async,noac,nolock,noatime,nodiratime,user,rw,soft,intr$opt $this->path $lp";
+			}
+			logger(LOG_DEBUG,"Running mount:$cmd");
+			exec($cmd, $out, $code);
+			if($code !=0){
+				throw new Exception("Failed to mount Storage: $lp. Error:". print_r($out, true));
+			}
+			$this->incrementRefCount(1);
+		}
+	}
+
+	function unmount(){
+		if($this->type ==0){ return; }
+		else{
+			$lp = getSetting("baseShare")."/$this->id";			
+			
+			$cnt = $this->incrementRefCount(-1);
+			$output = shell_exec("grep $lp /proc/mounts");
+			if (strpos($output, $lp) === false) {  
+				return;
+			}
+		
+			if($cnt <=0) {
+				echo "Last one out, umounting\n";
+				$cmd = "sudo umount -l $lp";
+				$res = shell_exec($cmd);				
+			}else{
+				echo "Still $cnt other users of this share.\n";
+			}
+		}
+	}
+
+	function haveDS($guid){
+		return $this->haveFile($guid.".qds");
+	}
+
+	function putFile($src, $dst){
+		$dst = ltrim($dst, "/");		
+		copy($src, "$this->basePath/$dst");
+	}
+	function putFileContents($src, $dst){
+		$dst = ltrim($dst, "/");		
+		file_put_contents("$this->basePath/$dst", $src);
+	}
+	function haveFile($fn){
+		$fp = "$this->basePath/$fn";
+		if(file_exists($fp)){return true;}
+		return false;
+	}
+	function getFile($remotePath, $targetPath) {
+		$fp = "$this->basePath/$remotePath";
+		copy($fp, $targetPath);
+	}
+	function getFileContents($remotePath) {
+		$fp = "$this->basePath/$remotePath";
+		return file_get_contents($fp);
+	}
+
+	function addDS($guid){
+		$fp = "$this->basePath/storage.json";
+		$tmp = json_decode(file_get_contents($fp));
+		array_push($tmp->datastores, $guid);
+		$tmp->datastores = array_unique($tmp->datastores);
+		file_put_contents($fp, json_encode($tmp));
+	}
+	function delDS($guid){
+		$fp = "$this->basePath/storage.json";
+		$tmp = json_decode(file_get_contents($fp));
+		$key = array_search($guid, $tmp->datastores);
+		if ($key !== false) {
+			unset($tmp->datastores[$key]);
+		}
+		file_put_contents($fp, json_encode($tmp));
+	}
+	function listDS(){
+		$fp = $this->getFileContents("/storage.json");
+		$tmp = json_decode($fp);
+
+		return $tmp->datastores;
+	}
+	// just finds and returns a list of all the guids found in this storage
+	function scan(){
+		$files = array_filter(glob($this->basePath . '/*.qds'), 'is_file');
+		$files = array_map(function($file) {
+			return preg_replace('#\.qds$#', '', basename($file));
+		}, $files);
+		return $files;
+	}
+}
+
+class StorageCloud extends StorageBase {
+	private string $basePath = "";
+	private string $confPath = "";
+
+    public function __construct($st) {
+        parent::__construct($st);		
+		$this->makeConf($st);  
+    }
+	public function __destruct(){
+        if(file_exists($this->confPath)){
+            //unlink($this->confPath);
+        }
+    }
+
+	private function makeConf($st){
+        $obj = new stdClass();
+        $obj->Bucket = $st->context;
+        $obj->Endpoint = $st->path;
+        $obj->Region = $st->options;
+        $obj->AccessKey = $st->user;
+        $obj->SecretKey = $st->pass;
+        $this->confPath = tempnam("/tmp/", 'ds.tmp');
+        file_put_contents($this->confPath, json_encode($obj));
+    }
+
+	public function getBasePath(){ 
+		return $this->basePath;
+	}
+
+	function haveDS($guid){
+		return $this->haveFile($guid."/ds.json");
+	}
+
+	function putFile($src, $dst){
+		if ($dst[0] == '/') { $dst = ltrim($dst, '/'); }
+        $res = runCloudTool("-put /$dst -o $src", $this->confPath);
+        if($res->result != "success"){
+            throw new Exception("Failed to putFile to Cloud storage: $dst Err: $res->message" );
+        }
+	}
+	function putFileContents($src, $dst){
+		if ($dst[0] == '/') { $dst = ltrim($dst, '/'); }
+		$tmp = tempnam("/tmp/", 'gf_tmp.');
+		file_put_contents($tmp, $src);
+        $res = runCloudTool("-put /$dst -o $tmp", $this->confPath);
+        if($res->result != "success"){
+            throw new Exception("Failed to putFile to Cloud storage: $dst Err: $res->message" );
+        }
+		unlink($tmp);
+	}
+	public function getFileContents($remotePath) {
+        $tmp = tempnam("/tmp/", 'gf_tmp.');
+        $this->getFile($remotePath, $tmp);
+        $out =file_get_contents($tmp);
+        unlink($tmp);
+        return $out;
+    }
+	public function getFile($remotePath, $targetPath) {
+        if ($remotePath[0] == '/') { $remotePath = ltrim($remotePath, '/'); }
+        $res = runCloudTool("-get /$remotePath -o $targetPath", $this->confPath);
+        if($res->result != "success"){
+            throw new Exception("Failed to getFile from Cloud storage: $remotePath Err: $res->message" );
+        }
+    }
+	public function haveFile($remotePath) {
+        if ($remotePath[0] == '/') { $remotePath = ltrim($remotePath, '/'); }
+        $res = runCloudTool("-stat /$remotePath", $this->confPath);
+        if($res->result != "success"){
+            throw new Exception("Failed to stat on Cloud storage: $remotePath Err: $res->message" );
+        }else if($res->message == "false"){
+            return false;
+        }
+        return true;
+    }
+
+	function addDS($guid){
+		$fp = $this->getFileContents("/storage.json");
+		$tmp = json_decode($fp);
+		array_push($tmp->datastores, $guid);		
+		$tmp->datastores = array_unique($tmp->datastores);
+		$tmpF = tempnam("/tmp/", 'storage_tmp.');
+		file_put_contents($tmpF, json_encode($tmp));
+		$this->putFile($tmpF, "/storage.json");		
+		unlink($tmpF);
+	}
+	function delDS($guid){
+		$fp = $this->getFileContents("/storage.json");
+		$key = array_search($guid, $tmp->datastores);
+		if ($key !== false) {
+			unset($tmp->datastores[$key]);
+		}
+		$tmpF = tempnam("/tmp/", 'storage_tmp.');
+		file_put_contents($tmpF, json_encode($tmp));
+		$this->putFile($tmpF, "/storage.json");
+		unlink($tmpF);
+	}
+
+	function listDS(){
+		$fp = $this->getFileContents("/storage.json");
+		$tmp = json_decode($fp);
+		if(!is_object($tmp)){
+			throw new Exception("Malformed Storage Meta");
+		}
+
+		return $tmp->datastores;
+		
+	}
+
+	// just finds and returns a list of all the guids found in this storage
+	function scan(){
+		$res = runCloudTool("-l /", $this->confPath);	// this is REALLY slow and inefficient for cloud storage (only)
+		return $res->files;
+	}
+}
+
+?>

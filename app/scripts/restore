@@ -1,0 +1,280 @@
+#!/usr/bin/php -q
+<?php
+
+include_once(__DIR__."/../libs/main_lib");
+include_once(__DIR__."/../libs/ds_lib");
+
+
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+
+if($argc < 2){ usage(); }
+
+$guid = "";
+$storageId = 0;
+$version=0;
+
+function usage(){
+        echo "Usage: -g <guid> -c <job config>\n";
+        exit(1);
+}
+
+$jobJson = "";
+
+// Parse our arguments
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-g"){
+		if($argc > $i){
+			$i++;
+			$guid = $argv[$i];
+		}	
+	}if($argv[$i] == "-c"){
+		if($argc > $i){
+			$i++;
+			$jobJson = $argv[$i];
+		}	
+	}
+}
+
+############################### Temp json maker
+$barf = new stdClass();
+$barf->storageId = 1;
+$barf->version = 1720719070;
+$barf->guid = "3a784312-93fa-fa31-e61b-671bff125c30";
+file_put_contents($jobJson, json_encode($barf));
+###############################################
+
+if(!file_exists($jobJson)){
+	logger(LOG_ERR,"Job config file ($jobJson) not found");
+	exit(1);
+}
+
+$j = json_decode(file_get_contents($jobJson));
+if ($j === null && json_last_error() !== JSON_ERROR_NONE) {
+	logger(LOG_ERR,"Failed to parse job config file ($jobJson)");
+	echo "Failed to parse job config: $jobJson\n";
+	exit(1);
+}
+
+//$j = new stdClass();
+
+$ds = null;
+
+// We will need:
+//	source storageid & guid
+//	source timestamp
+//
+//	dest host
+//	dest sr		(per vdi?)
+//	
+
+//	xen calls:
+//		make-vdi (sr size)
+//		make-vm  (from meta)
+//		make-vbd (vdi)
+
+
+try{
+	
+	if(empty($guid)){
+		die("No guid provided ($guid)\n");
+	}
+
+	$j->id = rand(1,1000);
+	$version = $j->version;
+
+    $ds = getDS($j->storageId,$guid);
+	
+	
+
+	try{
+        if(!$ds->isMounted()){
+            echo "*********** We're not mounted.  Lets mount ****************\n";
+            $ds->mount();
+        }
+    }catch(Exception $ex){
+        logger(LOG_ERR,"Error mounting DS: ".$ex->getMessage()." JobID $j->id");
+        exit(1);
+    }
+
+	if(!$ds->haveBackup($version)){
+		logger(LOG_ERR,"Backup $version not found in source DS JobID $j->id");
+		exit(1);
+	}
+	
+	
+	$res = doRestore($j, $guid, $version, $ds );
+	
+	exit($res);
+
+}catch(Exception $ex){
+	logger(LOG_ERR, $ex->getMessage() );
+	exit(1);
+}finally{
+    if(is_object($ds) ){
+        $dsSrc->unmount();
+    }
+
+}
+
+// the json config file expects a source storageId, a list of "targets" and their "version"
+//
+// it should be targets[] { guid, network, sr, version }
+
+//	Run a restore of a single system
+function doRestore($job, $guid, $version, $ds ){
+	$startTime = time();
+	// we need to pull both te host and sr from thejob settings
+	$h = getHost(1);			// we need to pull this from the job settings
+	$sr = "1d1e3ad2-5f26-fb3d-14bc-82203a73f55b";
+
+	$vm = getTarget($guid);
+	$inf = $ds->getBackupInfo($version);	
+	$tmpMeta = "/tmp/barf.tmp.meta";
+	file_put_contents($tmpMeta, json_encode($inf));
+
+	$vdis = [];
+	foreach($inf->disks as $d){
+		$res =xenCmd($h->ip, $h->username, $h->password, "vdi-create $d->size $sr \"$d->name\" ");	// if we know the desc, we could add it after the name
+		if($res->result != "success"){
+			throw new Exception("Failed to create VDI for restore: ". $res->message);
+		}
+		$vdis[$d->position] = $res->message;
+	}
+
+	logger(LOG_INFO,"Starting restore of $guid from backup $version");
+	foreach($vdis as $pos => $vdi){
+	//	$vdi = "930b3e50-2e0f-45b2-9749-b0c1818079d0";
+
+		$url = "http://$h->ip/import_raw_vdi?vdi=$vdi&format=raw";
+		$hclStr = $ds->getFileContents("$version/$pos.hcl");
+		$hcl = explode("\n", $hclStr);
+		logger(LOG_INFO,"Starting restore of $guid disk $pos from backup $version ");		
+		
+		uploadVdiToXen($url, $h, $hcl, $ds);
+	}
+
+	echo "Done with disk uploads...\n";
+
+	$metaJsonPath = $tmpMeta;	//this will need to be the location of the backup's meta.json file
+
+	$res =xenCmd($h->ip, $h->username, $h->password, "create-vm $metaJsonPath");	// if we know the desc, we could add it after the name
+	if(!is_object($res)){
+		throw new Exception("Failed to create VDI for restore: ". $res->message);
+	}
+
+	$vmGuid = $res->guid;
+
+	foreach($vdis as $pos => $vdi) {
+		$res =xenCmd($h->ip, $h->username, $h->password, "attach-vdi $vdi $vmGuid");	
+		print_r($res);
+
+	}
+	
+	
+	$elapsed = time() - $startTime;
+	$msg = "Completed restore of backup $version of $vm->name  in $elapsed seconds. [JobID $job->id]";
+	Joblog::log(LOG_INFO,$msg);
+	sendAlerts($msg);
+
+	// now we need to create a new VM from meta, and attach our VDIs (vbds) to it
+}
+
+
+
+
+// Send the data to Xen to restore the vdi
+//
+//	Cache a few blocks to speed things up.  Can pay off alot with blank data
+function uploadVdiToXen($url, $h, $hcl, $ds){
+	$context = stream_context_create(array(
+        'http' => array(
+            'method' => 'PUT',
+            'header' => array(
+                'Content-Type: application/octet-stream',
+				'Content-Encoding: gzip',
+                'Authorization: Basic ' . base64_encode("$h->username:$h->password")
+            ),
+            'content' => ''
+        )
+    ));
+
+	$numCached = 10;
+
+	$printCount = array();
+	foreach ($hcl as $hash) {
+		if (isset($printCount[$hash])) {			
+			$printCount[$hash]++;
+		} else {			
+			$printCount[$hash] = 1;
+		}
+	}
+	arsort($printCount);								// get our most common blocks 
+	$printCount = array_slice($printCount, 0, $numCached);	// pick the top X blocks to cache
+	$dupes = array();
+	foreach ($printCount as $hash => $count) {		
+		$dupes[$hash] = null;
+//		logger(LOG_DEBUG,"Adding $hash to restore cache ($count)");
+		
+	}
+	unset($printCount);	// free some memory, and hope GC comes around soon
+
+	$numLoops = count($hcl) -1;	// ignore the CODA
+	$workDir = "/tmp/";
+	$progFile = "$workDir/prog_rest.json";
+	$prg = new stdClass();
+	$prg->Progress =0;
+	file_put_contents($progFile, json_encode($prg));
+	
+	$version = "UNKNOWN";
+	$vmName = "VM NAME HERE";
+	$loglet = Joblog::getLoglet("Restoring backup $version of $vmName", LOG_INFO);
+	$kidPid = getProgress($progFile, $loglet); 
+
+	try{
+		$dst = fopen($url, 'r', false, $context);
+
+		if ($dst === false) {
+			throw new Exception("Failed to connect to Xen host for VDI restore: $url");
+		}
+		$i=0;
+		foreach($hcl as $line) {
+			
+				if ($line == "CODA"){ 
+					echo "Found CODA\n";
+					break; 
+				}
+				$block = trim("/blocks/" . substr($line, 0, 3) ."/$line");
+				if (array_key_exists($line, $dupes) ){
+					// This block is used more than once.  Let's cache it
+					if(is_null($dupes[$line])) {						
+						$dupes[$line] = zstd_uncompress($ds->getFileContents($block));
+					}else{
+						//echo "================== Reused block from cache: $block ===============\n";
+					}
+					fwrite($dst, $dupes[$line] );					
+				}else{					
+					//echo "\nTrying to put block $block ($i/$numLoops)\n";
+					fwrite($dst, zstd_uncompress($ds->getFileContents($block)) );	
+				}
+				$perc = ($i / $numLoops) * 100;    
+				$prg->Progress = round($perc, 2);
+				file_put_contents($progFile, json_encode($prg));
+				$i++;			
+		}
+
+		$prg->Progress=100;		
+		file_put_contents($progFile, json_encode($prg));
+		$loglet->setProgress(100);
+
+		fclose($dst);
+	}finally{
+		posix_kill($kidPid, SIGKILL);	// end our progress thread rightly
+	}
+}
+
+
+
+
+?>

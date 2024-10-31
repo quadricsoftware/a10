@@ -1,0 +1,580 @@
+<?php
+include_once(__DIR__."/common_lib");
+include_once(__DIR__."/hv_lib");
+
+
+////////////////////////////////////////////////////  DB Getter Setter stuff
+
+
+function getSetting($set){
+        return dbGetColumn("main", "SELECT val from settings where key=?", array($set));
+}
+function setSetting($set, $val){
+        return dbGetColumn("main", "INSERT or REPLACE  into settings(key,val) values(?,?)", array($set, $val));
+}
+
+function getTarget($guid){
+        $sql = "SELECT * from targets where guid=?";
+        $vm = dbGetOne("main", $sql, array($guid));
+        return $vm;
+}
+
+function setTarget($guid, $name, $poolid, $type, $ip, $user, $pass, $agent, $cpu, $mem, $os, $role, $id=0){
+        // vms (id , guid, name, poolid, type, ip, agent, cpu, memory, os)";
+        if($id==0){
+                $sql = "INSERT INTO targets values(NULL,?, ?, ?, ?, ?, ?, ?, ?,?,?,?,?) ";
+                return dbSet("main",  $sql, array($guid, $name, $poolid, $type, $ip, $agent, $cpu, $mem, $os));
+        }else{
+                $sql = "UPDATE targets set guid=?, name=?, poolid=?, type=?, ip=?, agent=?, cpu=?, $mem=?, $os=?, WHERE id=?) ";
+                return dbSet("main",  $sql, array($guid, $name, $poolid, $type, $ip, $agent, $cpu, $mem,  $os,  $id));
+        }
+}
+
+
+// Storage types:
+//  0 = local path
+//  1 = nfs
+//  2 = cifs
+//  3 = cloud
+function getStorageDB($id){
+	$sql = "SELECT * from storage where id=?";
+	$share = dbGetOne("main", $sql, array($id));
+        if(!is_object($share)){
+                throw new Exception("Storage $id not found in DB.");
+        }
+	return $share;	
+}
+function setStorage($name, $desc, $type, $path, $user, $pass, $context, $opts, $id=0){
+	// id INTEGER PRIMARY KEY, name TEXT, description TEXT, type INTEGER, path TEXT, user TEXT, pass TEXT, context TEXT, options TEXT
+	if($id==0){
+		$sql = "INSERT INTO storage values(NULL,?, ?, ?, ?, ?, ?, ?, ?) ";
+                auditLog("Added Storage $name ($path)");
+		return dbSet("main",  $sql, array($name, $desc, $type, $path, $user, $pass, $context, $opts));
+	}else{
+		$sql = "UPDATE storage set name=?, description=?, type=?, path=?, user=?, pass=?, context=?, options=? WHERE id=?) ";
+		return dbSet("main",  $sql, array($name, $desc, $type, $path, $user, $pass, $context, $opts, $id));
+	}
+}
+function getHost($id){
+        $sql = "SELECT * from hosts where id=?";
+        $share = dbGetOne("main", $sql, array($id));
+        return $share;
+}
+function setHost($guid, $name, $poolid, $type, $ip, $user, $pass, $agent, $cpu, $mem, $os, $role, $id=0){
+        // id guid name poolid type ip user pass agentJson cpu mem os role
+        if($id==0){
+                auditLog("Added Host $name ($ip)");
+                $sql = "INSERT or REPLACE INTO hosts values(NULL,?, ?, ?, ?, ?, ?, ?, ?,?,?,?,?) ";
+                return dbSet("main",  $sql, array($guid, $name, $poolid, $type, $ip, $user, $pass, $agent, $cpu, $mem, $os, $role));
+        }else{
+                $sql = "UPDATE hosts set guid=?, name=?, poolid=?, type=?, ip=?, username=?, password=?, agent=?, cpu=?, $mem=?, $os=?, $role=? WHERE id=?) ";
+                return dbSet("main",  $sql, array($guid, $name, $poolid, $type, $ip, $user, $pass, $agent, $cpu, $mem,  $os, $role, $id));
+        }
+}
+
+
+function getPoolMasters($pool=""){        
+	if(empty($pool)){
+		$sql = "SELECT id from hosts WHERE type=2 limit 1";
+		$res = dbGetColumn("main",  $sql, array());
+	}else{
+		$sql = "SELECT id from hosts where poolid=? ";                
+		$res = dbGetColumn("main",  $sql, array($pool));
+                return $res;
+	}
+}
+
+
+function setTargets($vms){
+        foreach ($vms as $vm){
+                $sql = "INSERT or REPLACE into targets (guid, name, poolid, type, ip, agent, cpu, memory, os, size) values(?,?,?,?,?,?,?,?,?,?)";
+                dbSet("main", $sql, array($vm->guid, $vm->name, $vm->poolid, $vm->type, $vm->ip, "", $vm->cpus, $vm->memory, "", $vm->totalSize) );
+        }
+
+}
+
+// For backups, targets is guid, storageId
+// For restores, targets is guid, storageId, version, sr
+// For mirrors, targets is guid, storageId, version, target storageId
+// For purge, targets is guid, storageId
+// For GFS, targets is guid, storageId  (options are days, weeks, months, years, concurrency, timeout/wait for lock?)
+//      options: concurrency, notification (boot, validate,?)
+//
+//      id , name , type , storageId , options (json)), targets (json)
+function addDefinition($name, $type, $options, $targets){
+        auditLog("Added Job Definition $name");
+        $tEncoded = json_encode($targets);
+        $oEncoded = json_encode($options);
+        return dbSet("main", "INSERT or REPLACE into definitions values(null, ?,?,?,?)", array($name, $type, $oEncoded, $tEncoded) );
+}
+function setDefinition($id, $name, $options, $targets){
+        $def= dbSet("main", "UPDATE definitions set name=?,  options=?, targets=? WHERE id=?", array( $name, $options, $targets, $id) );
+        $def->targets = json_decode($def->targets);
+        $def->options = json_decode($def->options);
+        return $def;
+}
+
+function getJob($jobId){
+        $job = dbGetOne("main", "SELECT * from jobs where id=?", array($jobId));
+        $job->targets = json_decode($job->targets);
+        $job->options = json_decode($job->options);
+        return $job;
+}
+
+function getJobDefinition($id){
+        $def = dbGetOne("main", "SELECT * from definitions where id=?", array($id));        
+        if(!is_object($def)){
+                throw new Exception("Job Definition $id not found in DB!");
+        }        
+        return $def;
+}
+
+// This is the crontab format.  '*' means every, '*/x' means every X 
+function makeBlankSchedule(){
+        $ent = new stdClass();
+        $ent->minute = 0;
+        $ent->hour = 0;
+        $ent->day = 0;
+        $ent->month =0;
+        $ent->weekday =0;
+        return $ent;
+}
+function getSchedule($defId){
+        $ct = new Crontab();
+        $script = __DIR__."/../scripts/jobRunner -s $defId";        
+        $i = $ct->findEntry($script );
+        if($i){
+                echo "I got $i\n";
+                return $ct->getEntry($i);
+        }
+        return null;
+}
+// the cron must be formatted thusly:
+//      'minute' => x,
+//      'hour' => x,
+//      'day' => x,
+//      'month' => x,
+//      'weekday' => x,
+function setSchedule($defId, $cron){
+        $ct = new Crontab();
+        $script = __DIR__."/../scripts/jobRunner -s $defId";        
+        $ct->addEntry($cron->minute, $cron->hour, $cron->day, $cron->month, $cron->weekday, $script);
+        auditLog("Addeded schedule $defId");
+}
+function pauseSchedule($defId){
+        $ct = new Crontab();
+        $script = __DIR__."/../scripts/jobRunner -s $defId";
+        $ct->pause($script);
+        auditLog("Paused schedule $defId");
+}
+function unpauseSchedule($defId){
+        $ct = new Crontab();
+        $script = __DIR__."/../scripts/jobRunner -s $defId";
+        $ct->unpause($script);
+        auditLog("Unpaused schedule $defId");
+}
+function delSchedule($defId){
+        $ct = new Crontab();
+        $script = __DIR__."/../scripts/jobRunner -s $defId";
+        $ent = $ct->findEntry($script);
+        if($ent !==false){
+                $ct->deleteEntry($ent);
+        }
+        auditLog("Deleted schedule $defId");
+}
+
+// We create a new job to run from a stored definition
+// Insert into the jobs table and create a /tmp/job.json file for use
+function spawnJob($defId){
+        // name , type , status , start , end , totalSize , totalStored , progress 
+        
+        $def = getJobDefinition($defId);
+        
+        $size = 0;
+        if($def->type == BACKUP){
+                $vms = json_decode($def->targets);
+                echo "targets:\n";
+                print_r($vms);
+                foreach($vms as $v){
+                        $vm = getTarget($v->guid);                        
+                        echo "I got target\n";
+                        print_r($vm);
+                        $size += $vm->size;
+                }
+        }
+        $status = PENDING;
+
+        $id = dbSet("main", "INSERT into jobs values(null,?,?,?,?,?,?,?,?,?,?)", array($def->name, $def->type, $status, time(), 0, $size, 0, 0, $def->options, $def->targets) );
+        $job = getJob($id);
+
+        $jjson = json_encode($job);        
+        $jobFile = "/tmp/job.$id.json";
+        // We will need to stuff the details from the jobDef in here too
+        file_put_contents($jobFile, $jjson);
+        return $job;
+}
+
+// We should look at the DS info to see if this should be a GFS or standard backup
+// If GFS, then mark it as gfs
+// Else, set it to standard
+// Then, if a GFS job comes, it will process the backups labeled as 'gfs' and ignore 'standard'
+function recordBackup($vmGuid, $ts, $jobId, $ds){
+        $sizeTotal=0;
+        $sizeSent=0;
+        $elapsed =0;
+        $stats = "/$ts/stats.json";
+        try{
+                $st = json_decode($ds->getFileContents($stats));
+                $sizeTotal = $st->TotalBytes;
+                $sizeSent = $st->BytesSentCompressed;
+                $elapsed = $st->SecondsTotal;
+        }catch(Exception $ex){
+                logger(LOG_WARNING, "Backup stats file not found ($stats)!");
+        }
+        $storageId = $ds->storageId;
+        $dsInfo = $ds->getInfo();
+
+        $type = "standard";
+        if($dsInfo->retention ==0){
+                $type = 'gfs';          // this is a placeholder which will be picked up by a gfs job and categorized
+        }
+
+        // id guid storageId ts size
+        logger(LOG_INFO, "Inserting backup $ts for $vmGuid into db: $vmGuid, $storageId, $ts, $sizeTotal, $sizeSent, $elapsed, $jobId, 0");
+        // id , guid , storageId , timestamp , sizeTotal , sizeStored , elapsed , jobId , type
+        dbSet("main", "INSERT or REPLACE into backups values(NULL,?,?,?,?,?,?,?,?)", array($vmGuid, $storageId, $ts, $sizeTotal, $sizeSent, $elapsed, $jobId, $type) );
+}
+
+function addHost($name, $ip, $type, $user, $pass){
+        if($type == XEN){
+                $res = xenCmd($ip, $user, $pass, "get-poolid");
+                $poolid = $res->poolid;
+                $res = xenCmd($ip, $user, $pass, "get-hosts");
+                
+                foreach($res->hosts as $h){
+                        echo "Adding $h->name\n";
+                        if(is_object($h) && $h->uuid != ""){
+                                setHost($h->uuid, $h->name, $poolid, $type, $h->ip, $user, $pass, "", -1, 0, "N/A", 1);
+                        }
+                }
+        }else{
+                $guid = \HV\getHostGuid($ip);                
+                $poolid = $guid;
+                // setHost($guid, $name, $poolid, $type, $ip, $user, $pass, $agent, $cpu, $mem, $os, $role, $id=0)
+                setHost($guid, $name, $poolid, $type, $ip, "", "", "", -1, 0, "Hyper-v", 0);
+                /* if($type == HV){                        
+                        dbSet("main", "update hosts set guid=? where ip=?", array($guid, $ip));
+                } */
+        }
+}
+
+
+// this is for executing binaries remotely
+// If $bg== true, then the process will be backgrounded and the remote PID will be returned
+// On linux targets, the child process will be reaped.  For windows... not needed?
+//
+function agentCmd($ip, $cmd, $args=null, $bg=false){
+	$payload = new stdClass();
+	$payload->args = [];
+        $payload->background = false;
+	if($args != null){ $payload->args = $args; }
+	if($bg){ $payload->background = true; }
+echo "\nRunning agentCmd: $cmd\n";
+
+	return doAgentPost($ip, "run/$cmd", json_encode($payload) );
+}
+
+// this if for running scripts (eg. Powershell on windows)
+function agentScript($ip, $cmd ){ 
+	$payload = new stdClass();
+	$payload->Script = $cmd;
+	return doAgentPost($ip, "execute", json_encode($payload) );
+}
+
+function agentPidCheck($ip, $pid){        
+	return doAgentPost($ip, "pid/$pid", null );
+}
+
+function agentUpload($ip, $local, $remote=null){ 
+	if (!file_exists($local)) {
+		throw new Exception("Agent upload error: Local file not found $local");
+	}
+	$boundary = uniqid();
+	$dat = file_get_contents($local);
+	if ($dat === false) {
+		throw new Exception("Error: Unable to read file contents: $local");
+	}
+        $targ = basename($local);
+        //$content = "";
+	if ($remote != null) {
+		$targ = $remote;
+                echo "Remote is not null\n";
+                //$targ = str_replace('/', '\\', $targ);
+                
+        }
+        $targ = str_replace('/', '\\', $targ);
+        echo "We;re sending to $targ\n";
+	$content = "--$boundary\r\n";
+	$content .= "Content-Disposition: form-data; name=\"file\"; filename=\"" . $targ . "\"\r\n";
+	$content .= "Content-Type: application/octet-stream\r\n\r\n";
+	$content .= $dat . "\r\n";	
+        $content .= "--$boundary\r\n";
+        $content .= "Content-Disposition: form-data; name=\"remotePath\"\r\n\r\n";
+        $content .= $remote . "\r\n";
+        $content .= "--$boundary--\r\n";
+        
+
+	return doAgentPost($ip, "upload", $content, $boundary );
+}
+function agentDownload($ip, $remote, $local){ 
+	$payload = new stdClass();
+	$payload->Filename = $remote;
+	$res = doAgentPost($ip, "download", json_encode($payload) );
+        file_put_contents($local, $res);        
+}
+
+function getAgentAccess($ip){
+	$out = new stdClass();
+        if(!isset($GLOBALS['agentPort'])){ $GLOBALS['agentPort'] = getSetting("agentPort");  }
+        if(!isset($GLOBALS['agentApiKey'])){ $GLOBALS['agentApiKey'] = getSetting("agentApiKey");  }
+	$apiKey = $GLOBALS['agentApiKey'];
+	$agentPort = $GLOBALS['agentPort'];
+	if(empty($agentPort)){ $agentPort = 8888; }
+	$out->uri = "$ip:$agentPort";
+	$out->apiKey = $apiKey;
+	return $out;
+}
+function doAgentPost($ip, $cmd, $data, $boundary=null){
+	$agent = getAgentAccess($ip);
+	$cmd = ltrim($cmd, '/');
+
+	$url = "https://$agent->uri/$cmd";
+	$ct = "Content-Type: application/json";
+	// for multipart uploads, we need some different header info
+	if($boundary != null){
+                $ct = "Content-Type: multipart/form-data; boundary=$boundary";
+	}
+	$options = [
+		'http' => [
+		    'method' => 'POST',
+		    'header' => [
+			'X-API-KEY: ' . $agent->apiKey,
+			$ct,
+			'Content-Length: ' . strlen($data)
+		    ],
+		    'content' => $data,
+		    'ignore_errors' => true // Needed to get errors
+		],
+		'ssl' => [
+		    'verify_peer' => false,	// we have ssl w/o names, so ignore these
+		    'verify_peer_name' => false
+		]
+	];
+
+	$context = stream_context_create($options);
+	$res= trim(file_get_contents($url, false, $context));
+	if($res == "Unknown request"){
+		throw new Exception("Error with Agent cmd: $res");
+	}
+
+        preg_match('/HTTP\/.* ([0-9]+)/', $http_response_header[0], $matches);
+        $code = $matches[1] ?? 'Unknown';
+
+        // Check if the status code is not 200
+        if ($code != 200) {                
+                echo "$url out: $res\n";
+                $err = "Agent response error";
+                if($code == 401){
+                        $err = "Unauthorized (API Key Failure)";
+                }else if($code == 404){
+                        $err = "404 Not Found";
+                }else if($code == 403){
+                        $err = "Access Denied";
+                }
+                $error = json_decode($res, true)['error'] ?? $err;
+                logger(LOG_WARN, "Error from Agent $ip: $err (HTTP $code): $res");
+                throw new Exception("HTTP Error $code: $res");
+        }
+	return $res;
+}
+
+function agentGetFileContents($ip, $remote){
+        $payload = new stdClass();
+	$payload->Filename = $remote;
+	return doAgentPost($ip, "download", json_encode($payload) );
+}
+
+
+
+
+// Joblog db:
+//      id, timestamp, elapsed jobid, guid, level, progress, text
+class Joblog {
+        private static $instance;
+        private static int $jobId = 0;
+        private static string $vmGuid ="";
+
+        public static function setup($jobId=0, $guid="") {
+                if (self::$instance === null) {
+                        self::$instance = new self($jobId, $guid);
+                }
+                return self::$instance;
+        }
+        private function __construct($jid, $guid= "") {
+                self::$jobId =$jid;
+                self::$vmGuid = $guid;
+        }
+	public static function log($lvl, $text, $prog=100){ 
+                return dbSet("joblog", "INSERT into joblog values(null,?,?,?,?,?,?,?)", array(time(), 0, self::$jobId, self::$vmGuid, $lvl, $prog, $text));
+	}
+        public static function update($id, $text, $elapsed=0, $prog=100){
+                dbSet("joblog", "UPDATE joblog set text=?, progress=?, elapsed=? where id=?", array($text, $prog, $elapsed, $id));
+        }
+
+        public static function getLoglet($text, $lvl= LOG_INFO){
+                $logId = dbSet("joblog", "INSERT into joblog values(null,?,?,?,?,?,?,?)", array(time(), 0, self::$jobId, self::$vmGuid, $lvl, 0, $text));
+                $lgl = new Loglet($logId, $lvl);
+                return $lgl;
+        }
+}
+
+// A simple utility class to help with logs and progress
+class Loglet {
+        private int $logId = 0;
+        private int $prog =0;
+        private int $level =LOG_INFO;
+        private int $started = 0;
+        private bool $completed =false;
+
+        public function __construct($id, $level) {
+                $this->logId = $id;
+                $this->level = $level;
+                $this->started = time();
+        }
+        public function __destruct() {
+                
+                if($this->prog < 100 && $this->level == LOG_INFO) { 
+                        $this->level = LOG_WARNING;   // if we die before completing, we escalate to a warning
+                }
+                if(!$this->completed){
+                        $elapsed = time() - $this->started;                
+                        dbSet("joblog", "UPDATE joblog set level=?, elapsed=? where id=?", array($this->level,$elapsed, $this->logId));
+                }                
+        }
+        public function tick($amt=1){
+                $this->prog += $amt;
+                if($this->prog >=100){
+                        $this->prog = 100;                        
+                }
+                $this->setProgress($this->prog);
+        }
+        public function setProgress($prg){
+                if($prg == 100){ $this->completed=true; }
+                $elapsed = time() - $this->started;
+                dbSet("joblog", "UPDATE joblog set progress=?, elapsed=? where id=?", array($prg, $elapsed, $this->logId));
+        }
+        
+        public function setLevel($level){
+                dbSet("joblog", "UPDATE joblog set level=? where id=?", array($level, $this->logId));
+        }
+        public function setText($txt){
+                dbSet("joblog", "UPDATE joblog set text=? where id=?", array($txt, $this->logId));
+        }
+}
+
+
+
+class Crontab {
+        private $entries = [];
+        private $lock = null;
+    
+        public function __construct() {
+                $this->lock = fopen('/tmp/crontab.lock', 'w');
+                $this->loadEntries();
+        }
+        public function __destruct(){                
+                $schedBak = __DIR__."/../dbs/schedules.bak";
+                exec("sudo crontab -l > $schedBak");
+        }
+    
+        private function loadEntries() {
+            exec('sudo crontab -l', $out);
+            foreach ($out as $line) {
+                if (trim($line) && substr(trim($line), 0, 1) != '#') {
+                    $parts = preg_split('/\s+/', trim($line), 6);
+                    $this->entries[] = (object)[
+                        'minute' => $parts[0],          //      0-59
+                        'hour' => $parts[1],            //      0-23
+                        'day' => $parts[2],             //      1-31    (-1 is the last of the month)
+                        'month' => $parts[3],           //      Month: 1-12
+                        'weekday' => $parts[4],         //  0-6 (0 = Sunday)
+                        'command' => $parts[5]
+                    ];                    
+                }
+            }
+        }
+    
+        public function getEntries() {
+            return $this->entries;
+        }
+    
+        public function saveAll() {
+                flock($this->lock, LOCK_EX);
+                $lines = [];
+                foreach ($this->entries as $entry) {
+                        $lines[] = "{$entry->minute} {$entry->hour} {$entry->day} {$entry->month} {$entry->weekday} {$entry->command}";
+                }
+                file_put_contents('/tmp/crontab.txt', implode("\n", $lines));
+                exec("echo '\n'>> /tmp/crontab.txt");
+                exec('sudo crontab /tmp/crontab.txt');                
+                flock($this->lock, LOCK_UN);
+        }    
+    
+        public function addEntry($minute, $hour, $day, $month, $weekday, $cmd) {                
+                $i = $this->findEntry($cmd);
+                if ($i !== false) {
+                        $this->entries[$i]->minute = $minute;
+                        $this->entries[$i]->hour = $hour;
+                        $this->entries[$i]->day = $day;
+                        $this->entries[$i]->month = $month;
+                        $this->entries[$i]->weekday = $weekday;
+                } else {
+                        $this->entries[] = (object)[
+                        'minute' => $minute,
+                        'hour' => $hour,
+                        'day' => $day,
+                        'month' => $month,
+                        'weekday' => $weekday,
+                        'command' => $cmd
+                        ];
+                }
+                $this->saveAll();                
+        }
+        
+        public function findEntry($cmd) {
+                foreach ($this->entries as $i => $entry) {
+                        if ($entry->command === $cmd) {                                
+                                return $i;
+                        }
+                }
+                return false;
+        }
+        public function deleteEntry($i) {
+                unset($this->entries[$i]);
+                $this->entries = array_values($this->entries);
+                $this->saveAll();
+        }
+
+        public function pause($i) {
+            $this->entries[$i]->minute = '# ' . $this->entries[$i]->minute;
+            $this->saveAll();
+        }
+    
+        public function unpause($i) {
+            $this->entries[$i]->minute = trim($this->entries[$i]->minute, '# ');            
+            $this->saveAll();
+        }
+    }
+    
+
+?>

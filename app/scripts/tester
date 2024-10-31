@@ -1,0 +1,360 @@
+#!/usr/bin/php -q
+<?php
+include_once(__DIR__."/../libs/main_lib");
+include_once(__DIR__."/../libs/ds_lib");
+include_once(__DIR__."/../libs/hv_lib");
+$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+
+try{
+	$script = file_get_contents("/tmp/ps");
+	$ip = "192.168.2.245";
+	$res = agentScript($ip, $script);
+	print_r(json_decode($res) );
+	exit();
+
+	$guid = "a07157a6c3994219808dbd2f59181327";
+	//$defBs = getSetting("blocksize");
+	//$defRet = getSetting("defaultRetention");
+	//$defCbt = getSetting("defaultCbt");
+	//$ds = getDS(2, $guid);
+	//$ds->create("Deb Physical", $defBs, $defRet, $defCbt);
+	$cnf = makeConfig(2, $guid, 1, array("/dev/xvda"));
+	print_r(json_encode($cnf) );
+	exit();
+
+	$ip = "192.168.1.18";
+	echo agentGetFileContents($ip, "job.3/stats.json");
+	
+	exit();
+	//$out = json_decode(agentCmd($ip, "notepad.exe", null, true ) );
+	//print_r($out);
+	//sleep(1);
+	//echo "Now let's check for pid: $out->pid\n";
+	$out = json_decode(agentPidCheck($ip, 392));
+	if($out->running == true){
+		echo "YES!\n";
+	}else{
+		echo "NO\n";
+	}
+	print_r($out);
+	exit();
+//	$out = agentCmd($ip, "munger.exe", array("-c", "job.3/munge.json") );
+	
+
+	print_r($out);
+	exit();
+
+	$out = agentUpload($ip, "/tmp/job.8.json", "job.8/DAMNIT.json" );
+	exit();
+
+
+
+
+$ts = time();
+$snapName = APP_NAME ."_$ts";
+$guid = "DF946BA1-3539-4EA7-A623-3BFCE1F7C527";
+$snapper = snapshotVm($ip, $guid , $snapName);
+echo "Took snapshot: $snapName\n";
+$snapDisks = getSnapDisks($ip, $guid, $snapName);
+foreach($snapDisks as $d){
+	$vhd = trim($d);
+	echo "Attaching $d to HV host...\n";
+	$physNum = attachVhd($ip, $vhd);	
+	$physDisk= "\\\\.\\PhysicalDrive$physNum";
+	echo "We should munge this: $physDisk\n";
+}
+sleep(2);
+foreach($snapDisks as $d){
+	$vhd = trim($d);
+	echo "Detaching $vhd...\n";
+	$out = detachVhd($ip, $vhd);
+}
+echo "Deleting snapshot $snapName\n";
+$out = deleteSnapshot($ip, $guid, $snapName);
+echo "All done!\n";
+exit();
+
+//$out = listVms($ip);
+//$out = getSnapDisks($ip, "DF946BA1-3539-4EA7-A623-3BFCE1F7C527", "Alike_27_1540321217");
+
+//$out = snapshotVm($ip, "DF946BA1-3539-4EA7-A623-3BFCE1F7C527", "FOOORBAR");
+//echo "Took snap FOOORBAR ($out)\n";
+$out = getSnapDisks($ip, "DF946BA1-3539-4EA7-A623-3BFCE1F7C527", "FOOORBAR");
+print_r($out);
+$vhd = trim($out[0]);
+$out = attachVhd($ip, $vhd);
+print_r($out);
+
+echo "\\\\.\\PhysicalDrive$out";
+
+echo "Detaching $vhd...\n";
+$out = detachVhd($ip, $vhd);
+print_r($out);
+
+//$out = deleteSnapshot($ip, "DF946BA1-3539-4EA7-A623-3BFCE1F7C527", "FOOORBAR");
+//echo "Deleted FOOORBAR\n";
+//print_r($out);
+
+
+
+//$out = getDefaultVhdPath($ip);
+//$out = getVmMeta($ip, "DF946BA1-3539-4EA7-A623-3BFCE1F7C527");	// gen 2
+//$out = getVmMeta($ip, "45CA9774-AF9C-423D-8A6A-8C3A7664CC84");	// gen 1
+
+
+//$cmd = "Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -ExpandProperty Name";
+//$out = agentScript($ip, $cmd );
+//$out = agentUpload($ip, "/tmp/job.1.json" );
+
+//$cmd = "notepad.exe";
+//$out = agentCmd($ip, $cmd, null, true );
+
+//print_r($out);
+}catch(Exception $ex){
+	echo "\nCaught Ex: ".$ex->getMessage()."\n";
+}
+exit();
+
+//$ds = getDs(2, "cd8f6758-efb4-532b-01da-ad1ef2e485f3");
+
+//$dsInfo = $ds->getInfo();
+//print_r($dsInfo);
+//$dsInfo->retention = 7;
+//$ds->setInfo($dsInfo);
+
+/* exit();
+$sched = getSchedule(1);
+
+print_r($sched);
+$ent = makeBlankSchedule();
+
+setSchedule(1, $ent);
+
+exit();
+$ds = getDs(2, "d05f4669-075c-eeea-aa15-32a285f84eaa");
+$ds->acquireDeleteLock();
+print_r($ds); */
+
+
+$tg = [];
+$guy = new stdClass();
+$guy->guid = "cd8f6758-efb4-532b-01da-ad1ef2e485f3";
+$guy->storageId = 5;
+array_push($tg, $guy);
+
+addDefinition("Backup VPN", BACKUP, null, $tg);
+
+exit();
+
+
+
+exit();
+
+
+$ds = getDS(2, "08cf97f9-8194-3f40-46b5-555cc19ad991");
+$inf = $ds->getInfo();
+print_r($inf);
+$inf->cbtEnable=1;
+$ds->setInfo($inf);
+exit();
+
+$ct = new Crontab();
+
+$ct->addEntry("0", "0", "0", "*", "-", "/bin/barfp");
+$i = $ct->findEntry("/backup/app/scripts/purge -s 1 -g ");
+if($i){
+echo "Found $id\n";
+}
+
+//$ct->pause($i);
+print_r($ct->getEntries());
+//$ct->deleteEntry($i);
+
+// List entries
+foreach ($ct->getEntries() as $entry) {
+    echo "{$entry->minute} {$entry->hour} {$entry->day} {$entry->month} {$entry->weekday} {$entry->command}\n";
+}
+
+exit();
+
+$ds = getDS(2, "08cf97f9-8194-3f40-46b5-555cc19ad991");
+
+$info = $ds->getInfo();
+$info->retention = 25;
+print_r($info);
+
+
+//$st = getStorage(4);
+//$st->mount();
+
+exit();
+//$ds = DSFactory::getDS(5, "barfomatic-loco");
+//print_r($ds);
+
+//$res = $ds->getInfo();
+//$ds->create("Teeny Guy", "Fake test ds local guy", 4);
+
+$meta = "this is bogus";
+$fp = "/tmp/meta.json.1719629884";
+file_put_contents($fp, json_encode($meta) );
+$ds->putFile($fp, "/1719629884/meta.json");
+//$ds->mount();
+//$res = $ds->getInfo();
+//print_r($res);
+
+//$ds->unmount();
+exit();
+
+echo "Beginning cold\n";
+//$res = $ds->isMounted();
+//if($res){ echo "We're mounted!\n"; }else{ echo "We're NOT mounted!\n"; }
+
+//$ds->purge();
+
+//echo "Now we mount\n";
+//$ds->mount();
+$res = $ds->putFile('/tmp/cloud.json','/ds.json');
+$vers = $ds->listBackups();
+$vers = $ds->listFiles('1719028377');
+print_r($vers);
+exit();
+
+echo "Putting...\n$res";
+$res = $ds->haveFile('/barfo');
+echo "Have file?\n$res";
+$res = $ds->getFileContents('/barfo');
+echo "Contents:$res\n";
+$res = $ds->deleteFile('/barfo');
+echo "Now to delete...\n$res";
+$res = $ds->haveFile('/barfo');
+echo "Have file?\n$res";
+exit();
+
+//if($argc < 2){ usage(); }
+//if($argv[1] != "import" ){ usage(); }
+
+$py = __DIR__."./xentWrapper";
+
+//echo "Act: $act\n";
+//exec(". $act", $output, $code);
+
+//if($code === 0){
+    $cmd = "xenWrapper";
+//	echo "Running: $cmd\n";
+	$barf = shell_exec($cmd); 
+print_r($barf);
+exit();
+	exec($cmd, $out, $code); 
+	$out = implode("\n", $out);
+	print_r(json_decode($out));
+
+	exec("deactivate");
+//}
+
+#purgeVersion("/mnt/storage/1/QCOWER2", "1718992484");
+exit();
+
+
+function usage(){
+        echo "Usage: [something] <args>\n";
+        echo "\tsomething: Not really sure yet\n";
+        exit(1);
+}
+
+setHost("fc321856-476d-493e-b385-37b2bcacadca", "mint2", "d60e9b3b-6f6b-c551-ec3c-dc68a9ebcda8", 2, "192.168.1.14", "root", "QSl@b2", "no agent", 1, 4096,"xcp-ng", 1);
+$h = getHost(1);
+print_r($h);
+exit();
+
+//$st = setStorage("103-CIFS","Test for CIFS on NAS103", 1, "//192.168.1.103/Public/butter", "admin", "QSl@b2","","");
+
+echo "Get storage:\n";
+$st = getStorage(1);
+print_r($st);
+
+$uuid = "BBBBBBBBBBBBBB";
+$path = mountQDS($st, $uuid);
+if(empty($path)){
+	echo "QDS Mount failed!\n";
+	return;
+}
+echo "We mounted: $path\n";
+
+echo shell_exec("ls -l $path");
+
+
+
+$snap = time();
+$tst = "$path/test_file";
+file_put_contents($tst, $snap);
+echo "Making snapshot $snap...\n";
+snapshotCreate($path, $snap);
+echo shell_exec("ls -l $path");
+
+unmountQDS($path);
+echo "We unmounted: $path\n";
+
+
+function makeConfig($sid, $guid, $jobId, $sources=null){
+	$ds = getDS($sid, $guid);
+	$workDir = "workDir";
+
+	$dsInfo = $ds->getInfo();
+	$ts = time();
+
+	// Go requires upper case for json variables
+	$conf = new stdClass();
+	$conf->JobID = intval($jobId);
+	$conf->JobType = 0;	// backup
+	$conf->BlockSize = $dsInfo->blocksize;	
+	$conf->Timestamp = $ts;
+	$conf->Concurrency = 4;
+	$conf->Sources = array();
+	if($sources != null){
+		$conf->Sources = $sources;
+	}
+	$conf->HcaFiles = array();
+	$conf->XclFiles = array();	
+	$conf->AuthCode = "None";			// only needed for http munges (get from settings db)
+	$conf->WorkDir = $workDir;
+	$conf->Guid = $guid;
+
+    // *****************
+    // This is not quite true.  A non-cloud munge could be servertype 0 or 1 (that just means munger is local or remote)
+    if($ds->type == 0){                      // DS->type 0 is all local types (disk, NFS, CIFS, etc)		
+		if($h->type == XEN){
+	        $conf->ServerType = 0;				// ServerTypes: 0=A10 local, 1=A10 url, 2=Cloud
+			$conf->ServerUrl = $ds->getPath();		// local file path for xen, remote mungers will need http
+		}
+    }else if($ds->type ==1){                // DS->type 1 is Cloud S3 
+        $conf->ServerType = 2;				// ServerType: 0=A10 local, 1=A10 url, 2=Cloud
+        $conf->Bucket = $ds->bucket;
+        $conf->AccessKey = $ds->key;
+        $conf->SecretKey = $ds->secret;
+        $conf->Region = $ds->region;
+        $conf->ServerUrl = $ds->endpoint;
+    }
+
+	return $conf;
+}
+
+
+
+
+/* 
+	Notes for client curl
+
+Run from $PATH
+curl -k -X POST -H "X-API-KEY: our_Secret_key" -H "Content-Type: application/json" -d '{"args": ["-an"]}' https://localhost:8888/run/uname
+
+Will also check CWD
+curl -k -X POST -H "X-API-KEY: our_Secret_key" -H "Content-Type: application/json" -d '{"args": ["-h"]}' https://localhost:8888/run/munger
+
+Also, no args
+curl -k -X POST -H "X-API-KEY: our_Secret_key"   https://localhost:8888/run/whoami
+
+
+curl -k -X POST -H "X-API-KEY: ALIKE" -H "Content-Type: application/json" -d '{"Script": "Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object -
+ExpandProperty Name"}' https://192.168.1.20:8888/execute
+{"output":"Microsoft Windows Server 2012 R2 Standard|C:\\Windows|\\Device\\Harddisk0\\Partition2\r\n"} */
+?>

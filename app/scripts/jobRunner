@@ -1,0 +1,177 @@
+#!/usr/bin/php -q
+<?php
+include_once(__DIR__ ."/../libs/main_lib");
+
+if($argc < 2){ usage(); }
+
+
+
+function usage(){
+	$me = pathinfo(__FILE__, PATHINFO_FILENAME);
+        echo "Run a configured job\n";
+        echo "Usage: $me -s <job definition id>\n";
+		echo "\t\t -a <adHocType 0=backup> -t <storageId> -g <guid>\n";
+        exit(1);
+}
+$defId = null;
+$adHocType = -1;
+$guid = null;
+$storageId =0;
+
+$args = array();
+for($i=0; $i < $argc; $i++ ){
+	if($argv[$i] == "-s"){
+		if($argc > $i){
+			$i++;
+			$defId = $argv[$i];
+		}	
+	}else if($argv[$i] == "-a"){
+		if($argc > $i){
+			$i++;
+			$adHocType = $argv[$i];
+		}	
+	}else if($argv[$i] == "-g"){
+		if($argc > $i){
+			$i++;
+			$guid = $argv[$i];
+		}
+	}else if($argv[$i] == "-t"){
+		if($argc > $i){
+			$i++;
+			$storageId = $argv[$i];
+		}
+	}
+}
+
+
+if ($defId === null && $adHocType == -1) {
+    echo "Please provide a defId as an argument.\n";
+    exit(1);
+}else if ($adHocType > 0 && ($guid==null || $storageId ==0)){
+	echo "Please provide -g <guid> -t <storageId> for an Adhoc backup\n";
+	exit();
+}
+
+
+// schedules vs jobs
+//
+//	schedule: Name, storageID, type, cron, {job options}, vms[] <-- json that includes options like drive inclusion, etc
+//		vm obj: uuid, name, QHB, included drives []
+
+//	job:	  Name, timestamp, endts, status, totalSize, totalStored	<-- do we need to store the vms?
+
+// 1. load definition from DB
+// 2. check for existing running jobs of this job and pend for X mins, then fail
+// 3. make a json working file for the job w/ all needed info
+// 4. loop over systems to process, running them at the specified concurrency level
+// 5. sum up progress of sub-tasks
+// 6. check for cancel (how?)
+
+// Misc.
+//	-other tasks?
+
+
+if($defId != null && $defId > 0){
+	makeJob($defId);
+}else if (!empty($guid) && $storageId > 0){
+	$job =makeAdHoc($guid, $storageId);
+	startJob($job);
+}
+
+
+function makeAdHoc($guid, $storageId){	
+    
+	$vm = getTarget($guid);
+	$size = $vm->size;
+	$target = new stdClass();
+	$target->guid = $guid;
+	$target->storageId = $storageId;
+	
+	$opts = "{}";
+	$status = PENDING;
+
+	$id = dbSet("main", "INSERT into jobs values(null,?,?,?,?,?,?,?,?,?,?)", array("Adhoc backup of $vm->name", BACKUP, $status, time(), 0, $size, 0, 0, $opts, json_encode(array($target)) ) );
+	$job = getJob($id);
+	return $job;	
+}
+
+function makeJob($defId) {
+	
+
+	$lockFile = "/tmp/jobRunner_{$defId}.lock";
+	$fp = fopen($lockFile, 'c+');
+	$start = time();
+	$timeout = 300; // make a setting
+
+	echo "Getting $defId\n";
+
+	while (true) {
+		if (flock($fp, LOCK_EX | LOCK_NB)) {
+			$wt = time() - $start;
+			echo "Acquired Job lock for defId {$defId} in $wt seconds\n";
+			
+			$job = spawnJob($defId);
+			startJob($job);
+		    
+			echo "$job->id completed.\n";
+			break;
+		}
+
+		// Let's just give up trying.
+		if (time() - $start >= $timeout) {
+			echo "Pending job timeout reached. Could not acquire lock for Job Definition {$defId} after 5 minutes.\n";
+			fclose($fp);
+			return;
+		}
+
+		echo "Lock not available for Job Definition {$defId}. Retrying...\n";
+		sleep(1);
+	}
+}
+
+
+function startJob($job){
+	$active = [];
+	
+	$concurrency =1;
+	if(isset($job->options->concurrency)){
+		$concurrency = $job->options->concurrency;
+	}
+	
+	Joblog::setup($job->id,"");
+	$loglet = Joblog::getLoglet("Starting Job $job->name [$job->id]", LOG_INFO);
+
+	foreach($job->targets as $t) {		
+
+		if (count($active) >= $concurrency) {
+			$pid = pcntl_wait($status);
+			unset($active[array_search($pid, $active)]);
+		}
+	    
+		$pid = pcntl_fork();
+		if ($pid == -1) {
+			die('Failed to start job (fork)');
+		} else if ($pid) {
+			$active[] = $pid;	// parent keeps track of kids
+		} else {
+			if($job->type == BACKUP){
+				Joblog::log(LOG_INFO, "Starting $t->guid");				
+				exec(__DIR__."/backup -j $job->id -g $t->guid", $out, $code);
+				Joblog::log(LOG_INFO, "Finished $t->guid");
+			}
+			exit();	// child exits here
+		}
+	}
+	
+
+	// Wait for them all to finish
+	while (count($active) > 0) {
+		$pid = pcntl_wait($status);
+		unset($active[array_search($pid, $active)]);
+	}
+
+	$loglet->setProgress(100);
+	Joblog::log(LOG_INFO, "Done processing targets");
+}
+
+?>
