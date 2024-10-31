@@ -188,22 +188,6 @@ print_r($info);
 //$st->mount();
 
 exit();
-//$ds = DSFactory::getDS(5, "barfomatic-loco");
-//print_r($ds);
-
-//$res = $ds->getInfo();
-//$ds->create("Teeny Guy", "Fake test ds local guy", 4);
-
-$meta = "this is bogus";
-$fp = "/tmp/meta.json.1719629884";
-file_put_contents($fp, json_encode($meta) );
-$ds->putFile($fp, "/1719629884/meta.json");
-//$ds->mount();
-//$res = $ds->getInfo();
-//print_r($res);
-
-//$ds->unmount();
-exit();
 
 echo "Beginning cold\n";
 //$res = $ds->isMounted();
@@ -261,12 +245,8 @@ function usage(){
         exit(1);
 }
 
-setHost("fc321856-476d-493e-b385-37b2bcacadca", "mint2", "d60e9b3b-6f6b-c551-ec3c-dc68a9ebcda8", 2, "192.168.1.14", "root", "QSl@b2", "no agent", 1, 4096,"xcp-ng", 1);
-$h = getHost(1);
-print_r($h);
 exit();
 
-//$st = setStorage("103-CIFS","Test for CIFS on NAS103", 1, "//192.168.1.103/Public/butter", "admin", "QSl@b2","","");
 
 echo "Get storage:\n";
 $st = getStorage(1);
